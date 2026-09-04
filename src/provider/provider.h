@@ -29,10 +29,11 @@ public:
     virtual ~Provider() = default;
 
     virtual ChatResponse chat(const std::string& prompt) = 0;
-    virtual EventStream complete(
+    virtual void complete(
         const std::vector<Message>& messages,
         const std::vector<ToolDefinition>& tools,
-        const std::string& system
+        const std::string& system,
+        EventSink& sink
     ) = 0;
     virtual const char* name() const = 0;
 

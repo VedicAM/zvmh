@@ -79,4 +79,10 @@ using StreamEvent = std::variant<
 
 using EventStream = std::vector<StreamEvent>;
 
+class EventSink {
+public:
+    virtual ~EventSink() = default;
+    virtual void on_event(const StreamEvent& event) = 0;
+};
+
 #endif

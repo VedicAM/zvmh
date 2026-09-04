@@ -1,8 +1,12 @@
 #include "openrouter.h"
 #include <cpr/cpr.h>
-#include <sstream>
 
 OpenRouter::OpenRouter(const std::string& api_key) : Provider(api_key, "openai/gpt-4o") {}
+
+static std::string api_url() {
+    const char* base = getenv("OPENROUTER_BASE_URL");
+    return base ? base : "https://openrouter.ai/api/v1/chat/completions";
+}
 
 const char* OpenRouter::name() const {
     return "openrouter";
@@ -15,7 +19,7 @@ ChatResponse OpenRouter::chat(const std::string& prompt) {
     };
 
     auto response = cpr::Post(
-        cpr::Url{"https://openrouter.ai/api/v1/chat/completions"},
+        cpr::Url{api_url()},
         cpr::Header{{"Authorization", "Bearer " + api_key_}},
         cpr::Header{{"Content-Type", "application/json"}},
         cpr::Body{request_body.dump()}
@@ -35,10 +39,74 @@ ChatResponse OpenRouter::chat(const std::string& prompt) {
     return result;
 }
 
-EventStream OpenRouter::complete(
+void OpenRouter::emit_sse_data(
+    const std::string& data,
+    EventSink& sink,
+    std::string& current_tool_id,
+    std::string& current_tool_name
+) {
+    if (data == "[DONE]") {
+        sink.on_event(MessageEndEvent{""});
+        return;
+    }
+
+    try {
+        auto chunk = nlohmann::json::parse(data);
+
+        if (chunk.contains("usage") && !chunk["usage"].is_null()) {
+            last_usage_.prompt_tokens = chunk["usage"].value("prompt_tokens", 0);
+            last_usage_.completion_tokens = chunk["usage"].value("completion_tokens", 0);
+        }
+
+        if (chunk.contains("choices") && !chunk["choices"].empty()) {
+            auto& choice = chunk["choices"][0];
+
+            if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
+                if (!current_tool_id.empty()) {
+                    current_tool_id.clear();
+                    current_tool_name.clear();
+                    sink.on_event(ToolUseEndEvent{});
+                }
+                sink.on_event(MessageEndEvent{choice["finish_reason"].get<std::string>()});
+            }
+
+            if (choice.contains("delta")) {
+                auto& delta = choice["delta"];
+
+                if (delta.contains("content") && !delta["content"].is_null()) {
+                    sink.on_event(TextDeltaEvent{delta["content"].get<std::string>()});
+                }
+
+                if (delta.contains("tool_calls")) {
+                    for (auto& tc : delta["tool_calls"]) {
+                        int index = tc.value("index", 0);
+
+                        if (tc.contains("id") && !tc["id"].is_null()) {
+                            current_tool_id = tc["id"].get<std::string>();
+                            current_tool_name = tc.contains("function") && tc["function"].contains("name")
+                                ? tc["function"]["name"].get<std::string>()
+                                : "";
+                            sink.on_event(ToolUseStartEvent{index, current_tool_id, current_tool_name});
+                        }
+
+                        if (tc.contains("function") && tc["function"].contains("arguments")
+                            && !tc["function"]["arguments"].is_null()) {
+                            sink.on_event(ToolInputDeltaEvent{index, tc["function"]["arguments"].get<std::string>()});
+                        }
+                    }
+                }
+            }
+        }
+    } catch (const nlohmann::json::exception&) {
+        // Skip malformed JSON
+    }
+}
+
+void OpenRouter::complete(
     const std::vector<Message>& messages,
     const std::vector<ToolDefinition>& tools,
-    const std::string& system
+    const std::string& system,
+    EventSink& sink
 ) {
     nlohmann::json request_body = {
         {"model", model_},
@@ -107,85 +175,47 @@ EventStream OpenRouter::complete(
         request_body["tools"] = api_tools;
     }
 
-    auto response = cpr::Post(
-        cpr::Url{"https://openrouter.ai/api/v1/chat/completions"},
-        cpr::Header{{"Authorization", "Bearer " + api_key_}},
-        cpr::Header{{"Content-Type", "application/json"}},
-        cpr::Body{request_body.dump()}
-    );
+    cpr::Session session;
+    session.SetUrl(cpr::Url{api_url()});
+    session.SetHeader(cpr::Header{
+        {"Authorization", "Bearer " + api_key_},
+        {"Content-Type", "application/json"},
+    });
+    session.SetBody(cpr::Body{request_body.dump()});
 
-    if (response.status_code != 200) {
-        throw std::runtime_error("OpenRouter API error: " + std::to_string(response.status_code) + " " + response.text);
-    }
-
-    EventStream events;
-    std::istringstream stream(response.text);
-    std::string line;
-
+    std::string pending_line;
     std::string current_tool_id;
     std::string current_tool_name;
+    std::string error_tail;
+    constexpr size_t kErrorTail = 16384;
 
-    while (std::getline(stream, line)) {
-        if (line.substr(0, 6) == "data: ") {
-            std::string data = line.substr(6);
+    session.SetWriteCallback(cpr::WriteCallback([&](std::string_view data, intptr_t) {
+        error_tail.append(data);
+        if (error_tail.size() > kErrorTail) {
+            error_tail = error_tail.substr(error_tail.size() - kErrorTail);
+        }
 
-            if (data == "[DONE]") {
-                events.push_back(MessageEndEvent{""});
-                break;
-            }
+        pending_line.append(data);
+        size_t pos;
+        while ((pos = pending_line.find('\n')) != std::string::npos) {
+            std::string line = pending_line.substr(0, pos);
+            pending_line.erase(0, pos + 1);
 
-            try {
-                auto chunk = nlohmann::json::parse(data);
-
-                if (chunk.contains("usage") && !chunk["usage"].is_null()) {
-                    last_usage_.prompt_tokens = chunk["usage"].value("prompt_tokens", 0);
-                    last_usage_.completion_tokens = chunk["usage"].value("completion_tokens", 0);
-                }
-
-                if (chunk.contains("choices") && !chunk["choices"].empty()) {
-                    auto& choice = chunk["choices"][0];
-
-                    if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
-                        if (!current_tool_id.empty()) {
-                            current_tool_id.clear();
-                            current_tool_name.clear();
-                            events.push_back(ToolUseEndEvent{});
-                        }
-                        events.push_back(MessageEndEvent{choice["finish_reason"].get<std::string>()});
-                    }
-
-                    if (choice.contains("delta")) {
-                        auto& delta = choice["delta"];
-
-                        if (delta.contains("content") && !delta["content"].is_null()) {
-                            events.push_back(TextDeltaEvent{delta["content"].get<std::string>()});
-                        }
-
-                        if (delta.contains("tool_calls")) {
-                            for (auto& tc : delta["tool_calls"]) {
-                                int index = tc.value("index", 0);
-
-                                if (tc.contains("id") && !tc["id"].is_null()) {
-                                    current_tool_id = tc["id"].get<std::string>();
-                                    current_tool_name = tc.contains("function") && tc["function"].contains("name")
-                                        ? tc["function"]["name"].get<std::string>()
-                                        : "";
-                                    events.push_back(ToolUseStartEvent{index, current_tool_id, current_tool_name});
-                                }
-
-                                if (tc.contains("function") && tc["function"].contains("arguments")
-                                    && !tc["function"]["arguments"].is_null()) {
-                                    events.push_back(ToolInputDeltaEvent{index, tc["function"]["arguments"].get<std::string>()});
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (const nlohmann::json::exception&) {
-                // Skip malformed JSON
+            if (line.substr(0, 6) == "data: ") {
+                emit_sse_data(line.substr(6), sink, current_tool_id, current_tool_name);
             }
         }
-    }
+        return true;
+    }));
 
-    return events;
+    auto response = session.Post();
+
+    if (response.error) {
+        throw std::runtime_error("OpenRouter request error: " + response.error.message
+            + (error_tail.empty() ? "" : " " + error_tail));
+    }
+    if (response.status_code != 200) {
+        throw std::runtime_error(
+            "OpenRouter API error: " + std::to_string(response.status_code) + " " + error_tail);
+    }
 }

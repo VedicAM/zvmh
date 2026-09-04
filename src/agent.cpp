@@ -2,6 +2,7 @@
 #include <iostream>
 #include <map>
 #include <nlohmann/json.hpp>
+#include "tui/tui.h"
 
 struct ActiveToolCall {
     std::string id;
@@ -10,12 +11,45 @@ struct ActiveToolCall {
     nlohmann::json input;
 };
 
-static std::string trim(const std::string& s) {
-    size_t start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return "";
-    size_t end = s.find_last_not_of(" \t\r\n");
-    return s.substr(start, end - start + 1);
-}
+namespace {
+class StdoutSink : public StreamSink {
+public:
+    void header(const std::string& provider, const std::string& model) override {
+        std::cout << "\n  \033[2m[" << provider << " · " << model << "]\033[0m\n";
+    }
+    void text_delta(const std::string& text) override {
+        std::cout << text << std::flush;
+    }
+    void tool_start(const std::string& name) override {
+        std::cout << "\n\n  \033[36m→ \033[1m" << name << "\033[0m\n";
+    }
+    void summary(const std::string& model, int prompt_tokens, int completion_tokens) override {
+        std::cout << "  \033[2m" << std::string(52, '-') << "\033[0m\n"
+                  << "  \033[2mmodel: \033[0m" << model
+                  << "  \033[2m| tokens in: \033[0m" << prompt_tokens
+                  << "  \033[2m| out: \033[0m" << completion_tokens << "\n";
+    }
+    void tool_call(const std::string& name, const nlohmann::json& args) override {
+        std::cout << "  \033[33m▸ \033[1m" << name << "\033[0m " << args.dump() << "\n";
+    }
+    void tool_result(const std::string& result, bool is_error) override {
+        if (is_error) {
+            std::cerr << "  \033[31m" << result << "\033[0m\n";
+            return;
+        }
+        std::string display = result;
+        if (display.size() > 220) {
+            display = display.substr(0, 220) + "...\n";
+        } else if (!display.empty() && display.back() != '\n') {
+            display += "\n";
+        }
+        std::cout << "  \033[32m↩ \033[0m" << display << "\n";
+    }
+    void warning(const std::string& text) override {
+        std::cerr << "  \033[31m" << text << "\033[0m\n";
+    }
+};
+}  // namespace
 
 Agent::Agent(std::unique_ptr<Provider> provider)
     : provider_(std::move(provider)), system_prompt_("You are a helpful assistant.") {
@@ -31,10 +65,44 @@ void Agent::add_message(const Message& message) {
 }
 
 int Agent::run_once(const std::string& prompt) {
-    return run_turn(prompt);
+    StdoutSink sink;
+    return run_turn(prompt, sink);
 }
 
-int Agent::run_turn(const std::string& prompt) {
+class TurnBridge : public EventSink {
+public:
+    TurnBridge(
+        StreamSink& sink,
+        std::string& response_text,
+        std::vector<ActiveToolCall>& tool_calls,
+        std::map<int, int>& tool_index
+    )
+        : sink_(sink), text_(response_text), calls_(tool_calls), index_(tool_index) {}
+
+    void on_event(const StreamEvent& event) override {
+        if (auto* text_delta = std::get_if<TextDeltaEvent>(&event)) {
+            text_ += text_delta->text;
+            sink_.text_delta(text_delta->text);
+        } else if (auto* tool_start = std::get_if<ToolUseStartEvent>(&event)) {
+            calls_.push_back({tool_start->id, tool_start->name, "", nlohmann::json::object()});
+            index_[tool_start->index] = static_cast<int>(calls_.size()) - 1;
+            sink_.tool_start(tool_start->name);
+        } else if (auto* tool_delta = std::get_if<ToolInputDeltaEvent>(&event)) {
+            auto it = index_.find(tool_delta->index);
+            if (it != index_.end()) {
+                calls_[static_cast<size_t>(it->second)].input_json += tool_delta->input;
+            }
+        }
+    }
+
+private:
+    StreamSink& sink_;
+    std::string& text_;
+    std::vector<ActiveToolCall>& calls_;
+    std::map<int, int>& index_;
+};
+
+int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
     size_t history_start = messages_.size();
 
     Message user_msg;
@@ -46,31 +114,14 @@ int Agent::run_turn(const std::string& prompt) {
 
     try {
         for (int step = 0; step < max_steps; ++step) {
-            std::cout << "\n  \033[2m[" << provider_->name() << " · " << provider_->model() << "]\033[0m\n";
-
-            EventStream events = provider_->complete(messages_, registry_.definitions(), system_prompt_);
+            sink.header(provider_->name(), provider_->model());
 
             std::string response_text;
             std::vector<ActiveToolCall> tool_calls;
             std::map<int, int> tool_index;  // api delta index -> tool_calls position
 
-            for (const auto& event : events) {
-                if (auto* text_delta = std::get_if<TextDeltaEvent>(&event)) {
-                    response_text += text_delta->text;
-                    std::cout << text_delta->text << std::flush;
-                } else if (auto* tool_start = std::get_if<ToolUseStartEvent>(&event)) {
-                    tool_calls.push_back({tool_start->id, tool_start->name, "", nlohmann::json::object()});
-                    tool_index[tool_start->index] = static_cast<int>(tool_calls.size()) - 1;
-                    std::cout << "\n\n  \033[36m→ \033[1m" << tool_start->name << "\033[0m\n";
-                } else if (auto* tool_delta = std::get_if<ToolInputDeltaEvent>(&event)) {
-                    auto it = tool_index.find(tool_delta->index);
-                    if (it != tool_index.end()) {
-                        tool_calls[it->second].input_json += tool_delta->input;
-                    }
-                }
-            }
-
-            std::cout << "\n";
+            TurnBridge bridge(sink, response_text, tool_calls, tool_index);
+            provider_->complete(messages_, registry_.definitions(), system_prompt_, bridge);
 
             Message assistant_msg;
             assistant_msg.role = Role::Assistant;
@@ -93,39 +144,30 @@ int Agent::run_turn(const std::string& prompt) {
             messages_.push_back(assistant_msg);
 
             TokenUsage usage = provider_->last_usage();
-            std::cout << "  \033[2m" << std::string(52, '-') << "\033[0m\n";
-            std::cout << "  \033[2mmodel: \033[0m" << provider_->model()
-                      << "  \033[2m| tokens in: \033[0m" << usage.prompt_tokens
-                      << "  \033[2m| out: \033[0m" << usage.completion_tokens << "\n";
+            sink.summary(provider_->model(), usage.prompt_tokens, usage.completion_tokens);
 
             if (!had_tools) {
                 return 0;
             }
 
             for (const auto& tc : tool_calls) {
-                std::cout << "  \033[33m▸ \033[1m" << tc.name << "\033[0m "
-                          << tc.input.dump() << "\n";
+                sink.tool_call(tc.name, tc.input);
 
                 std::string result;
+                bool is_error = false;
                 try {
                     Tool* tool = registry_.get(tc.name);
                     if (!tool) {
                         result = "Error: Unknown tool: " + tc.name;
+                        is_error = true;
                     } else {
                         result = tool->execute(tc.input);
                     }
                 } catch (const std::exception& e) {
                     result = std::string("Error: ") + e.what();
-                    std::cerr << "  \033[31m" << result << "\033[0m\n";
+                    is_error = true;
                 }
-
-                std::string display = result;
-                if (display.size() > 220) {
-                    display = display.substr(0, 220) + "...\n";
-                } else if (!display.empty() && display.back() != '\n') {
-                    display += "\n";
-                }
-                std::cout << "  \033[32m↩ \033[0m" << display << "\n";
+                sink.tool_result(result, is_error);
 
                 Message tool_msg;
                 tool_msg.role = Role::User;
@@ -134,10 +176,10 @@ int Agent::run_turn(const std::string& prompt) {
             }
         }
 
-        std::cerr << "  \033[31mError:\033[0m Reached maximum tool steps (" << max_steps << ")\n";
+        sink.warning("Reached maximum tool steps (" + std::to_string(max_steps) + ")");
         return 1;
     } catch (const std::exception& e) {
-        std::cerr << "  \033[31mError:\033[0m " << e.what() << "\n";
+        sink.warning(std::string("Error: ") + e.what());
         if (messages_.size() > history_start) {
             messages_.resize(history_start);
         }
@@ -145,95 +187,7 @@ int Agent::run_turn(const std::string& prompt) {
     }
 }
 
-void Agent::handle_command(const std::string& input) {
-    std::string cmd = trim(input);
-
-    if (cmd.rfind("/model", 0) == 0) {
-        std::string arg = trim(cmd.substr(6));
-        if (arg.empty()) {
-            std::cout << "  current model: \033[1m" << provider_->model() << "\033[0m\n"
-                      << "  set a new model with: /model <name>\n";
-        } else {
-            provider_->set_model(arg);
-            std::cout << "  model set to: \033[1m" << provider_->model() << "\033[0m\n";
-        }
-        return;
-    }
-
-    if (cmd == "/tools" || cmd.rfind("/tools ", 0) == 0) {
-        std::string arg = trim(cmd.substr(6));
-        std::cout << "  registered tools:\n";
-        auto defs = registry_.definitions();
-        if (arg.empty()) {
-            for (const auto& def : defs) {
-                std::cout << "    - \033[1m" << def.name << "\033[0m  " << def.description << "\n";
-            }
-        } else {
-            Tool* tool = registry_.get(arg);
-            if (tool) {
-                std::cout << "    - \033[1m" << tool->name() << "\033[0m  " << tool->description() << "\n"
-                          << "      schema: " << tool->parameters_schema().dump() << "\n";
-            } else {
-                std::cout << "    unknown tool: '" << arg << "'\n";
-            }
-        }
-        return;
-    }
-
-    if (cmd == "/clear") {
-        messages_.clear();
-        std::cout << "  conversation cleared.\n";
-        return;
-    }
-
-    if (cmd == "/help") {
-        std::cout << "  /model            show current model\n"
-                  << "  /model <name>     switch model (e.g. /model openai/gpt-3.5)\n"
-                  << "  /tools            list tools\n"
-                  << "  /tools <name>     show tool schema\n"
-                  << "  /clear            clear conversation history\n"
-                  << "  /exit, /quit      leave the REPL\n";
-        return;
-    }
-
-    if (cmd == "/exit" || cmd == "/quit") {
-        return;
-    }
-
-    std::cout << "  unknown command: '" << cmd << "'   (try /help)\n";
-}
-
-int Agent::repl() {
-    std::cout << "\n"
-              << "  \033[1mZVMH\033[0m · coding agent\n"
-              << "  " << std::string(38, '-') << "\n"
-              << "  provider : \033[1m" << provider_->name() << "\033[0m\n"
-              << "  model    : \033[1m" << provider_->model() << "\033[0m\n"
-              << "  tools    : " << registry_.definitions().size() << " registered\n"
-              << "  " << std::string(38, '-') << "\n"
-              << "  Commands: '/help' for commands, 'exit' or 'quit' to leave\n\n";
-
-    std::string input;
-    while (true) {
-        std::cout << "\033[1;32m> \033[0m" << std::flush;
-        std::getline(std::cin, input);
-        if (!std::cin) {
-            std::cout << "\n";
-            break;
-        }
-        if (input.empty()) {
-            continue;
-        }
-        if (input == "exit" || input == "quit" || input == "/exit" || input == "/quit") {
-            break;
-        }
-        if (input[0] == '/') {
-            handle_command(input);
-            continue;
-        }
-        run_turn(input);
-    }
-
-    std::cout << "\nGoodbye.\n";
-    return 0;
+int Agent::run_tui() {
+    Tui tui(*this);
+    return tui.run();
 }
