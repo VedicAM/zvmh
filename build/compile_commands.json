@@ -1,0 +1,44 @@
+[
+{
+  "directory": "/Users/vedicmukherjee/zvmh/build",
+  "command": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -I/Users/vedicmukherjee/zvmh/vendor/json/include -isystem /usr/local/include -g -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk -o CMakeFiles/zvmh.dir/src/main.cpp.o -c /Users/vedicmukherjee/zvmh/src/main.cpp",
+  "file": "/Users/vedicmukherjee/zvmh/src/main.cpp",
+  "output": "CMakeFiles/zvmh.dir/src/main.cpp.o"
+},
+{
+  "directory": "/Users/vedicmukherjee/zvmh/build",
+  "command": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -I/Users/vedicmukherjee/zvmh/vendor/json/include -isystem /usr/local/include -g -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk -o CMakeFiles/zvmh.dir/src/agent.cpp.o -c /Users/vedicmukherjee/zvmh/src/agent.cpp",
+  "file": "/Users/vedicmukherjee/zvmh/src/agent.cpp",
+  "output": "CMakeFiles/zvmh.dir/src/agent.cpp.o"
+},
+{
+  "directory": "/Users/vedicmukherjee/zvmh/build",
+  "command": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -I/Users/vedicmukherjee/zvmh/vendor/json/include -isystem /usr/local/include -g -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk -o CMakeFiles/zvmh.dir/src/auth/ClaudeAuth.cpp.o -c /Users/vedicmukherjee/zvmh/src/auth/ClaudeAuth.cpp",
+  "file": "/Users/vedicmukherjee/zvmh/src/auth/ClaudeAuth.cpp",
+  "output": "CMakeFiles/zvmh.dir/src/auth/ClaudeAuth.cpp.o"
+},
+{
+  "directory": "/Users/vedicmukherjee/zvmh/build",
+  "command": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -I/Users/vedicmukherjee/zvmh/vendor/json/include -isystem /usr/local/include -g -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk -o CMakeFiles/zvmh.dir/src/auth/CodexAuth.cpp.o -c /Users/vedicmukherjee/zvmh/src/auth/CodexAuth.cpp",
+  "file": "/Users/vedicmukherjee/zvmh/src/auth/CodexAuth.cpp",
+  "output": "CMakeFiles/zvmh.dir/src/auth/CodexAuth.cpp.o"
+},
+{
+  "directory": "/Users/vedicmukherjee/zvmh/build",
+  "command": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -I/Users/vedicmukherjee/zvmh/vendor/json/include -isystem /usr/local/include -g -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk -o CMakeFiles/zvmh.dir/src/provider/OpenRouter.cpp.o -c /Users/vedicmukherjee/zvmh/src/provider/OpenRouter.cpp",
+  "file": "/Users/vedicmukherjee/zvmh/src/provider/OpenRouter.cpp",
+  "output": "CMakeFiles/zvmh.dir/src/provider/OpenRouter.cpp.o"
+},
+{
+  "directory": "/Users/vedicmukherjee/zvmh/build",
+  "command": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -I/Users/vedicmukherjee/zvmh/vendor/json/include -isystem /usr/local/include -g -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk -o CMakeFiles/zvmh.dir/src/provider/Claude.cpp.o -c /Users/vedicmukherjee/zvmh/src/provider/Claude.cpp",
+  "file": "/Users/vedicmukherjee/zvmh/src/provider/Claude.cpp",
+  "output": "CMakeFiles/zvmh.dir/src/provider/Claude.cpp.o"
+},
+{
+  "directory": "/Users/vedicmukherjee/zvmh/build",
+  "command": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -I/Users/vedicmukherjee/zvmh/vendor/json/include -isystem /usr/local/include -g -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk -o CMakeFiles/zvmh.dir/src/provider/Codex.cpp.o -c /Users/vedicmukherjee/zvmh/src/provider/Codex.cpp",
+  "file": "/Users/vedicmukherjee/zvmh/src/provider/Codex.cpp",
+  "output": "CMakeFiles/zvmh.dir/src/provider/Codex.cpp.o"
+}
+]
