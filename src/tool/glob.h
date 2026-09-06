@@ -9,7 +9,28 @@ class GlobTool : public Tool {
 public:
     const char* name() const override { return "glob"; }
     const char* description() const override {
-        return "Find files matching a glob pattern";
+        return R"(Find files and directories matching a glob pattern and return their paths, one per line.
+
+WHEN TO USE
+- the prompt names a file pattern to find ("all .cpp files", "every *_test.py")
+- enumerating files before reading them
+
+WHEN NOT TO USE
+- searching file contents: use grep
+- listing a single directory's entries: use ls
+
+DO NOT USE FOR
+- regex or content search: this matches names only
+
+USAGE
+- pattern: glob such as src/*.h or **/CMakeLists.txt; each * matches one path component (** is not deeply recursive)
+- path: optional base directory prepended to the pattern (default: workspace root)
+- returns an error string when nothing matches
+
+EXAMPLES
+- {"pattern": "src/*/*.h"}
+- {"pattern": "**/CMakeLists.txt", "path": "vendor"}
+- {"pattern": "build/zvmh"})";
     }
 
     nlohmann::json parameters_schema() const override {

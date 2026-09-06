@@ -23,6 +23,7 @@ add_executable(zvmh src/main.cpp
     src/tool/tool.h
     src/tui/tui.cpp
     src/tui/tui.h
+    src/tui/markdown.h
     src/tui/prompt_editor.h
     src/tool/registry.h
     src/tool/bash.h

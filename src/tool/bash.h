@@ -17,7 +17,33 @@ public:
 
     const char* name() const override { return "bash"; }
     const char* description() const override {
-        return "Execute a shell command and return its output";
+        return R"(Run a shell command in a subprocess and return its merged stdout+stderr output.
+
+WHEN TO USE
+- run commands, scripts, builds, tests, git operations, or any task that needs a real shell
+- verify work after changes (build, run tests, check output)
+- transform or move files when no dedicated tool fits
+
+WHEN NOT TO USE
+- reading a file: use read
+- searching file contents: use grep
+- listing a directory: use ls
+- finding files by name pattern: use glob
+
+DO NOT USE FOR
+- editing a file: use edit for a targeted replacement, write for a whole-file rewrite
+
+USAGE
+- command: one shell string; chain steps with && or a newline, e.g. "a && b"
+- workdir: optional directory to run in (default: workspace root)
+- timeout: optional milliseconds, default 120000, max 600000
+- stdout and stderr are merged; output capped at 1MB (truncation notice appended)
+- on timeout the whole process group is killed; blocking/interactive commands hang until timeout
+
+EXAMPLES
+- {"command": "git status --short"}
+- {"command": "cmake -S . -B build && cmake --build build"}
+- {"command": "python tests/runner.py", "workdir": "tests", "timeout": 300000})";
     }
 
     nlohmann::json parameters_schema() const override {

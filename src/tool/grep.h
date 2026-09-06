@@ -10,7 +10,29 @@ class GrepTool : public Tool {
 public:
     const char* name() const override { return "grep"; }
     const char* description() const override {
-        return "Search for a regex pattern in files";
+        return R"(Search for a literal substring in file contents and return matching lines as file:line: text.
+
+WHEN TO USE
+- locating where a symbol, word, or string appears in the codebase before reading it
+- checking whether a term is referenced anywhere
+
+WHEN NOT TO USE
+- finding files by name: use glob
+- reading an entire file: use read
+
+DO NOT USE FOR
+- regex: matching is a plain substring search, not a regex engine
+
+USAGE
+- pattern: literal substring; regex metacharacters have no special meaning
+- path: optional file or directory (default: workspace root); include: optional literal filename filter
+- case-sensitive; capped at 50 total matches (notice appended)
+- directories are searched recursively
+
+EXAMPLES
+- {"pattern": "run_turn"}
+- {"pattern": "TODO", "path": "src"}
+- {"pattern": "class Tool", "path": "src", "include": ".h"})";
     }
 
     nlohmann::json parameters_schema() const override {

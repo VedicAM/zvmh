@@ -288,14 +288,14 @@ private:
             const std::string line = content_.substr(rows[r].start, rows[r].end - rows[r].start);
             if (empty && r == 0) {
                 cells.push_back(hbox({
-                    text("\u258F") | bold | color(Color::GreenLight),
-                    text("Type a prompt, press Enter to send. Shift+Enter for a new line. /help for commands.") | dim,
+                    text("\u2588") | bold | color(Color::White),
+                    // text("Type a prompt, press Enter to send. Shift+Enter for a new line. /help for commands.") | dim,
                 }));
             } else if (static_cast<int>(r) == cursor_row) {
                 const size_t local = static_cast<size_t>(cursor_) - rows[r].start;
                 cells.push_back(hbox({
                     text(line.substr(0, local)),
-                    text("\u258F") | bold | color(Color::GreenLight),
+                    text("\u2588") | bold | color(Color::White),
                     text(line.substr(local)),
                 }));
             } else {

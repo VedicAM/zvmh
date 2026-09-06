@@ -8,7 +8,27 @@ class LsTool : public Tool {
 public:
     const char* name() const override { return "ls"; }
     const char* description() const override {
-        return "List files and directories in a path";
+        return R"(List the immediate entries of a directory, one per line, directories suffixed with "/".
+
+WHEN TO USE
+- exploring an unknown directory structure before reading files
+- confirming what files exist in a folder
+
+WHEN NOT TO USE
+- finding files by name pattern: use glob (recursive)
+- searching file contents: use grep
+- reading a file: use read
+
+DO NOT USE FOR
+- recursive listings: this lists only the direct children; use glob or bash for deeper trees
+
+USAGE
+- path: optional, defaults to "." (workspace root)
+- entries are unsorted (filesystem order); directories end with "/"
+
+EXAMPLES
+- {"path": "src"}
+- {"path": "vendor"})";
     }
 
     nlohmann::json parameters_schema() const override {

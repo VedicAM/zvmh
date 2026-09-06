@@ -9,7 +9,29 @@ class EditTool : public Tool {
 public:
     const char* name() const override { return "edit"; }
     const char* description() const override {
-        return "Edit a file by searching for a string and replacing it";
+        return R"(Replace the first occurrence of old_string with new_string inside a file.
+
+WHEN TO USE
+- modifying a specific part of an existing file without rewriting the rest
+- fixing a line, renaming a symbol, or tweaking a config value
+
+WHEN NOT TO USE
+- replacing a whole file: use write
+- creating a new file: use write
+
+DO NOT USE FOR
+- bulk or repeated replacements: only the first occurrence is replaced; apply edit once per target or use bash sed
+- blind edits without knowing the exact current text: read first, then match byte-for-byte
+
+USAGE
+- file_path: file to modify
+- old_string: must match the file byte-for-byte; include surrounding context to disambiguate repeats
+- new_string: replacement; empty deletes old_string
+- whitespace, tabs, and newlines count
+
+EXAMPLES
+- {"file_path": "src/agent.h", "old_string": "std::string system_prompt_;", "new_string": "std::string system_prompt_ = \"You are a helpful assistant.\";"}
+- {"file_path": "CMakeLists.txt", "old_string": "src/agent.cpp", "new_string": "src/agent.cpp\n    src/main.cpp"})";
     }
 
     nlohmann::json parameters_schema() const override {
