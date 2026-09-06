@@ -8,6 +8,7 @@
 #include "provider/provider.h"
 #include "message/message.h"
 #include "tool/registry.h"
+#include "system/registry.h"
 
 class StreamSink {
 public:
@@ -27,6 +28,13 @@ private:
     std::vector<Message> messages_;
     std::string system_prompt_;
     Registry registry_;
+    sysctx::SystemContextRegistry sys_context_registry_;
+    std::vector<sysctx::RegistrationHandle> sys_context_handles_;
+    sysctx::Snapshot sys_context_snapshot_;
+    std::string sys_context_text_;
+    bool sys_context_initialized_ = false;
+
+    std::string build_system_prompt(StreamSink& sink);
 
 public:
     explicit Agent(std::unique_ptr<Provider> provider);
@@ -38,6 +46,8 @@ public:
     std::string provider_name() const { return provider_->name(); }
     std::string model() const { return provider_->model(); }
     void set_model(const std::string& model) { provider_->set_model(model); }
+    TokenUsage usage() const { return provider_->last_usage(); }
+    int context_window() { return provider_->context_window(provider_->model()); }
     std::vector<ToolDefinition> tools() const { return registry_.definitions(); }
     Tool* tool(const std::string& name) const { return registry_.get(name); }
     void clear_messages() { messages_.clear(); }

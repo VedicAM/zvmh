@@ -1,4 +1,5 @@
 #include "tui.h"
+#include "prompt_editor.h"
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -11,7 +12,9 @@
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/box.hpp>
 #include <ftxui/screen/color.hpp>
+#include <ftxui/screen/terminal.hpp>
 
 #include <nlohmann/json.hpp>
 #include "../agent.h"
@@ -27,6 +30,8 @@ std::string trim_string(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
+// Display width (columns) of a UTF-8 string, treating tab as one column and
+// counting non-ASCII code points as two columns.
 struct Line {
     std::string text;
     Color color = Color::Default;
@@ -48,6 +53,8 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     Agent& agent;
     ScreenInteractive screen = ScreenInteractive::Fullscreen();
     std::atomic<bool> busy_{false};
+    std::atomic<int> ctx_window_{0};
+    std::atomic<uint32_t> anim_phase_{0};
 
     std::mutex mutex_;
     std::vector<Line> lines_;
@@ -56,10 +63,15 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     std::string last_summary_;
     std::string input_;
 
+    bool follow_bottom_ = true;
+    size_t view_line_ = 0;
+    Box transcript_box_;
+
     static constexpr size_t kNone = static_cast<size_t>(-1);
 
     Component layout_;
     Component input_component_;
+    int input_cursor_ = 0;
 
     explicit Impl(Agent& agent_ref) : agent(agent_ref) {}
 
@@ -141,6 +153,8 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                 append(Line{"set a new model with: /model <name>", Color::GrayDark, true, false});
             } else {
                 agent.set_model(arg);
+                ctx_window_.store(0);
+                refresh_context();
                 append(Line{"model set to: " + agent.model(), Color::Cyan, true, false});
             }
         } else if (cmd == "/tools" || cmd.rfind("/tools ", 0) == 0) {
@@ -163,10 +177,12 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
             }
         } else if (cmd == "/clear") {
             agent.clear_messages();
+            follow_bottom_ = true;
+            view_line_ = 0;
             append(Line{"conversation cleared.", Color::GrayDark, false, true});
         } else if (cmd == "/help") {
             append(Line{"/model             show current model", Color::Default, false, false});
-            append(Line{"/model <name>      switch model (e.g. /model openai/gpt-3.5)", Color::Default, false, false});
+            append(Line{"/model <name>      switch model (e.g. /model openai/gpt-3.5-turbo)", Color::Default, false, false});
             append(Line{"/tools             list tools", Color::Default, false, false});
             append(Line{"/tools <name>      show tool schema", Color::Default, false, false});
             append(Line{"/clear             clear conversation history", Color::Default, false, false});
@@ -181,9 +197,19 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
 
     // --- Turn execution (worker thread) ---
 
+    void refresh_context() {
+        std::thread([this] {
+            int ctx = agent.context_window();
+            ctx_window_.store(ctx);
+            screen.PostEvent(Event::Custom);
+        }).detach();
+    }
+
     void run_turn_async(const std::string& prompt) {
         busy_.store(true);
+        anim_phase_.store(0);
         screen.PostEvent(Event::Custom);
+        std::thread([this] { animate_while_busy(); }).detach();
         std::thread([this, prompt] {
             int rc = agent.run_turn(prompt, *this);
             flush_live_text();
@@ -194,6 +220,15 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         }).detach();
     }
 
+    void animate_while_busy() {
+        while (busy_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (!busy_.load()) break;
+            anim_phase_.fetch_add(1);
+            screen.PostEvent(Event::Custom);
+        }
+    }
+
     void submit() {
         if (busy_.load()) {
             append(Line{"still running a turn...", Color::GrayDark, false, true});
@@ -202,6 +237,7 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         std::string prompt = trim_string(input_);
         if (prompt.empty()) return;
         input_.clear();
+        input_cursor_ = 0;
         if (prompt[0] == '/') {
             handle_command(prompt);
             return;
@@ -225,38 +261,92 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         return vbox(std::move(elements)) | vscroll_indicator | yframe | flex;
     }
 
+    Element context_element() {
+        const int ctx = ctx_window_.load();
+        const TokenUsage usage = agent.usage();
+        const int used = usage.prompt_tokens;
+
+        if (ctx <= 0) {
+            return text("ctx: --") | dim;
+        }
+
+        int filled = used * 12 / ctx;
+        if (filled < 0) filled = 0;
+        if (filled > 12) filled = 12;
+
+        std::string bar;
+        for (int i = 0; i < filled; ++i) bar += "\u2588";
+        for (int i = filled; i < 12; ++i) bar += "\u2591";
+
+        const double frac = static_cast<double>(used) / ctx;
+        const int pct = static_cast<int>(frac * 100 + 0.5);
+        Color bar_color = used < ctx / 2 ? Color::Green
+                          : used < ctx * 4 / 5 ? Color::Yellow
+                                               : Color::RedLight;
+
+        return hbox({
+                   text("ctx ") | dim,
+                   text(bar) | color(bar_color),
+                   text(" " + std::to_string(pct) + "% " +
+                        std::to_string(used) + "/" + std::to_string(ctx)) | dim,
+               });
+    }
+
+    Element loading_element() {
+        // Indeterminate loader: a soft shade gradient slides across the bar.
+        const int cells = 14;
+        const int pos = static_cast<int>(anim_phase_.load()) % (cells + 4) - 2;
+
+        std::string bar;
+        for (int i = 0; i < cells; ++i) {
+            int d = i - pos;
+            if (d < 0) d = -d;
+            bar += d == 0 ? "\u2588"   // █ peak
+                   : d == 1 ? "\u2593" // ▓
+                   : d == 2 ? "\u2592" // ▒
+                   : "\u2591";         // ░
+        }
+        bar += "  typing";
+
+        return hbox({
+                   text(" ") | dim,
+                   text(bar) | color(Color::Yellow),
+                   text(" ") | dim,
+               });
+    }
+
     Element status_element() {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (busy_.load()) {
+            return hbox({
+                loading_element(),
+                filler(),
+                context_element() | size(WIDTH, LESS_THAN, 30),
+                filler(),
+                text(last_summary_)
+                    | size(WIDTH, LESS_THAN, 60) | dim,
+            });
+        }
         return hbox({
-            text(busy_.load() ? "● running" : "○ idle")
-                | color(busy_.load() ? Color::Yellow : Color::Green),
+            text("○ idle") | color(Color::Green),
             filler(),
-            text(last_summary_) | dim,
+            context_element() | size(WIDTH, LESS_THAN, 30),
+            filler(),
+            text(last_summary_)
+                | size(WIDTH, LESS_THAN, 60) | dim,
         });
     }
 
     void setup() {
-        InputOption input_option = InputOption::Default();
-        input_option.multiline = false;
-        input_option.placeholder = "Type a prompt, press Enter. /help for commands.";
-
-        input_component_ = Input(&input_, input_option);
-        input_component_ |= CatchEvent([this](Event event) {
-            if (event == Event::Return) {
-                submit();
-                return true;
-            }
-            return false;
-        });
+        input_component_ = Make<PromptEditor>(input_, input_cursor_, [this] { submit(); });
+        input_component_->TakeFocus();
 
         auto prompt_glyph = Renderer(input_component_, [this] {
             std::string glyph = busy_.load() ? "…" : "❯";
             return hbox({
-                       text(glyph) | color(busy_.load() ? Color::Yellow : Color::GreenLight) | bold,
-                       text(" "),
+                       text(glyph + " ") | color(busy_.load() ? Color::Yellow : Color::GreenLight) | bold,
                        input_component_->Render() | flex,
-                   }) |
-                   size(HEIGHT, EQUAL, 1);
+                   });
         });
 
         auto transcript = Renderer([this] { return transcript_element(); });
@@ -279,9 +369,57 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                    }) |
                    borderRounded;
         });
+
+        refresh_context();
     }
 
     // --- ComponentBase ---
+
+    int page_height() const {
+        int h = transcript_box_.y_max - transcript_box_.y_min + 1;
+        return h > 1 ? h : 15;
+    }
+
+    bool scroll_event(Event event) {
+        int step = 0;
+        if (event == Event::PageUp || event == Event::PageDown) {
+            step = (event == Event::PageUp ? -1 : 1) * page_height();
+        } else if (event.is_mouse()) {
+            auto& m = event.mouse();
+            if (m.button == Mouse::WheelUp) {
+                step = -2;
+            } else if (m.button == Mouse::WheelDown) {
+                step = 2;
+            }
+        }
+        if (step == 0) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (lines_.size() <= 1) {
+            return false;
+        }
+
+        const size_t last = lines_.size() - 1;
+        if (step < 0) {
+            if (follow_bottom_) {
+                view_line_ = last;
+                follow_bottom_ = false;
+            }
+            const size_t back = static_cast<size_t>(-step);
+            view_line_ = view_line_ > back ? view_line_ - back : 0;
+        } else {
+            if (follow_bottom_) {
+                return false;
+            }
+            view_line_ += static_cast<size_t>(step);
+            if (view_line_ >= last) {
+                follow_bottom_ = true;
+            }
+        }
+        return true;
+    }
 
     bool OnEvent(Event event) override {
         if (event == Event::Custom) {

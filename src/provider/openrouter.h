@@ -14,6 +14,7 @@ public:
         EventSink& sink
     ) override;
     const char* name() const override;
+    int query_context_window(const std::string& model) override;
 
 private:
     void emit_sse_data(

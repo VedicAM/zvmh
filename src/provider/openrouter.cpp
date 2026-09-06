@@ -1,15 +1,48 @@
 #include "openrouter.h"
 #include <cpr/cpr.h>
 
-OpenRouter::OpenRouter(const std::string& api_key) : Provider(api_key, "openai/gpt-4o") {}
+OpenRouter::OpenRouter(const std::string& api_key) : Provider(api_key, "openai/gpt-3.5-turbo") {}
 
 static std::string api_url() {
     const char* base = getenv("OPENROUTER_BASE_URL");
     return base ? base : "https://openrouter.ai/api/v1/chat/completions";
 }
 
+static std::string models_url() {
+    std::string url = api_url();
+    const std::string suffix = "/chat/completions";
+    if (url.size() >= suffix.size() && url.compare(url.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        url.replace(url.size() - suffix.size(), suffix.size(), "/models");
+    } else {
+        url += "/models";
+    }
+    return url;
+}
+
 const char* OpenRouter::name() const {
     return "openrouter";
+}
+
+int OpenRouter::query_context_window(const std::string& model) {
+    auto response = cpr::Get(
+        cpr::Url{models_url()},
+        cpr::Header{{"Authorization", "Bearer " + api_key_}},
+        cpr::Timeout{10}
+    );
+    if (response.error || response.status_code != 200) {
+        return -1;
+    }
+    try {
+        auto json = nlohmann::json::parse(response.text);
+        for (auto& entry : json.value("data", nlohmann::json::array())) {
+            if (entry.value("id", "") == model) {
+                return entry.value("context_length", -1);
+            }
+        }
+    } catch (const nlohmann::json::exception&) {
+        // Fall through to unknown
+    }
+    return -1;
 }
 
 ChatResponse OpenRouter::chat(const std::string& prompt) {

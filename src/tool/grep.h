@@ -40,15 +40,17 @@ public:
 
         std::string result;
         std::string include_pattern = input.value("include", "");
+        int total_results = 0;
 
         if (std::filesystem::is_regular_file(path)) {
-            result += search_file(path, pattern);
+            result += search_file(path, pattern, total_results);
         } else if (std::filesystem::is_directory(path)) {
             for (const auto& entry : std::filesystem::recursive_directory_iterator(path)) {
+                if (total_results >= 50) break;
                 if (entry.is_regular_file()) {
                     std::string filename = entry.path().filename().string();
                     if (include_pattern.empty() || matches_pattern(filename, include_pattern)) {
-                        result += search_file(entry.path().string(), pattern);
+                        result += search_file(entry.path().string(), pattern, total_results);
                     }
                 }
             }
@@ -60,11 +62,15 @@ public:
             return "No matches found";
         }
 
+        if (total_results >= 50) {
+            result += "\n(Results limited to 50 matches)";
+        }
+
         return result;
     }
 
 private:
-    std::string search_file(const std::string& file_path, const std::string& pattern) {
+    std::string search_file(const std::string& file_path, const std::string& pattern, int& total_results) {
         std::ifstream file(file_path);
         if (!file.is_open()) {
             return "";
@@ -75,8 +81,10 @@ private:
         int line_num = 1;
 
         while (std::getline(file, line)) {
+            if (total_results >= 50) break;
             if (line.find(pattern) != std::string::npos) {
                 result += file_path + ":" + std::to_string(line_num) + ": " + line + "\n";
+                total_results++;
             }
             line_num++;
         }

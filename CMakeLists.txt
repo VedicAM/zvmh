@@ -23,6 +23,7 @@ add_executable(zvmh src/main.cpp
     src/tool/tool.h
     src/tui/tui.cpp
     src/tui/tui.h
+    src/tui/prompt_editor.h
     src/tool/registry.h
     src/tool/bash.h
     src/tool/edit.h
@@ -30,7 +31,10 @@ add_executable(zvmh src/main.cpp
     src/tool/grep.h
     src/tool/ls.h
     src/tool/read.h
-    src/tool/write.h)
+    src/tool/write.h
+    src/system/systemcontext.h
+    src/system/registry.h
+    src/system/builtins.h)
 
 target_link_libraries(zvmh PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(zvmh PRIVATE cpr::cpr)

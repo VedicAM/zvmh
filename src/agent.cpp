@@ -3,6 +3,7 @@
 #include <map>
 #include <nlohmann/json.hpp>
 #include "tui/tui.h"
+#include "system/builtins.h"
 
 struct ActiveToolCall {
     std::string id;
@@ -54,6 +55,7 @@ public:
 Agent::Agent(std::unique_ptr<Provider> provider)
     : provider_(std::move(provider)), system_prompt_("You are a helpful assistant.") {
     register_builtin_tools(registry_);
+    sys_context_handles_ = register_system_context_builtins(sys_context_registry_);
 }
 
 void Agent::set_system_prompt(const std::string& prompt) {
@@ -62,6 +64,51 @@ void Agent::set_system_prompt(const std::string& prompt) {
 
 void Agent::add_message(const Message& message) {
     messages_.push_back(message);
+}
+
+std::string Agent::build_system_prompt(StreamSink& sink) {
+    std::string system = system_prompt_;
+    sysctx::SystemContext context = sys_context_registry_.load();
+
+    if (!sys_context_initialized_) {
+        auto result = sysctx::initialize(context);
+        if (auto* gen = std::get_if<sysctx::Generation>(&result)) {
+            sys_context_text_ = gen->baseline;
+            sys_context_snapshot_ = gen->snapshot;
+            sys_context_initialized_ = true;
+            if (!gen->baseline.empty()) system += "\n\n" + gen->baseline;
+        } else if (const auto* blocked = std::get_if<sysctx::InitializationBlocked>(&result)) {
+            sink.warning(blocked->message());
+        }
+        return system;
+    }
+
+    sysctx::ReconcileResult reconciled = sysctx::reconcile(context, sys_context_snapshot_);
+    switch (reconciled.tag) {
+        case sysctx::ReconcileResult::Tag::Unchanged:
+            if (!sys_context_text_.empty()) system += "\n\n" + sys_context_text_;
+            break;
+        case sysctx::ReconcileResult::Tag::Updated:
+            sys_context_text_ = reconciled.text;
+            sys_context_snapshot_ = reconciled.snapshot;
+            if (!reconciled.text.empty()) system += "\n\n" + reconciled.text;
+            break;
+        case sysctx::ReconcileResult::Tag::ReplacementReady:
+            if (reconciled.generation) {
+                sys_context_text_ = reconciled.generation->baseline;
+                sys_context_snapshot_ = reconciled.generation->snapshot;
+                if (!reconciled.generation->baseline.empty()) {
+                    system += "\n\n" + reconciled.generation->baseline;
+                }
+            }
+            break;
+        case sysctx::ReconcileResult::Tag::ReplacementBlocked:
+            if (!sys_context_text_.empty()) system += "\n\n" + sys_context_text_;
+            break;
+        case sysctx::ReconcileResult::Tag::Replace:
+            break;
+    }
+    return system;
 }
 
 int Agent::run_once(const std::string& prompt) {
@@ -113,6 +160,8 @@ int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
     const int max_steps = 10;
 
     try {
+        std::string system_prompt = build_system_prompt(sink);
+
         for (int step = 0; step < max_steps; ++step) {
             sink.header(provider_->name(), provider_->model());
 
@@ -121,7 +170,7 @@ int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
             std::map<int, int> tool_index;  // api delta index -> tool_calls position
 
             TurnBridge bridge(sink, response_text, tool_calls, tool_index);
-            provider_->complete(messages_, registry_.definitions(), system_prompt_, bridge);
+            provider_->complete(messages_, registry_.definitions(), system_prompt, bridge);
 
             Message assistant_msg;
             assistant_msg.role = Role::Assistant;
