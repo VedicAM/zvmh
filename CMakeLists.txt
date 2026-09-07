@@ -9,6 +9,7 @@ set(JSON_BuildTests OFF CACHE INTERNAL "")
 set(JSON_Install OFF CACHE INTERNAL "")
 
 find_package(cpr REQUIRED)
+find_package(Threads REQUIRED)
 
 add_subdirectory(vendor/json)
 add_subdirectory(vendor/ftxui)
@@ -33,6 +34,13 @@ add_executable(zvmh src/main.cpp
     src/tool/ls.h
     src/tool/read.h
     src/tool/write.h
+    src/tool/msg.h
+    src/tool/peers.h
+    src/server/protocol.h
+    src/server/server.h
+    src/server/server.cpp
+    src/server/client.h
+    src/server/client.cpp
     src/system/systemcontext.h
     src/system/registry.h
     src/system/builtins.h)
@@ -40,3 +48,4 @@ add_executable(zvmh src/main.cpp
 target_link_libraries(zvmh PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(zvmh PRIVATE cpr::cpr)
 target_link_libraries(zvmh PRIVATE ftxui::ftxui)
+target_link_libraries(zvmh PRIVATE Threads::Threads)

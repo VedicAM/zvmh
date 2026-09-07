@@ -61,8 +61,17 @@ size_t pe_glyph_back(const std::string& s, size_t pos) {
 // width instead of wrapping them, so we draw our own editor here.
 class PromptEditor : public ComponentBase {
 public:
-    PromptEditor(std::string& content, int& cursor, std::function<void()> on_submit)
-        : content_(content), cursor_(cursor), on_submit_(std::move(on_submit)) {
+    PromptEditor(
+        std::string& content,
+        int& cursor,
+        std::function<void()> on_submit,
+        std::function<void()> on_history_prev = {},
+        std::function<void()> on_history_next = {})
+        : content_(content),
+          cursor_(cursor),
+          on_submit_(std::move(on_submit)),
+          on_history_prev_(std::move(on_history_prev)),
+          on_history_next_(std::move(on_history_next)) {
         const auto size = Terminal::Size();
         if (size.dimx > 0) avail_ = size.dimx - 6;
     }
@@ -74,6 +83,8 @@ private:
     std::string& content_;
     int& cursor_;
     std::function<void()> on_submit_;
+    std::function<void()> on_history_prev_;
+    std::function<void()> on_history_next_;
     Box box_;
     int avail_ = 40;
 
@@ -183,9 +194,21 @@ private:
         int col = 0;
         cursor_position(rows, &row, &col);
         const int target = row + dir;
-        if (target < 0 || target >= static_cast<int>(rows.size())) {
-            return false;
+
+        // At the top edge, Up recalls the previous prompt from history;
+        // at the bottom edge, Down recalls the next one.
+        if (target < 0) {
+            if (dir < 0 && on_history_prev_)
+                on_history_prev_();
+            return true;
         }
+
+        if (target >= static_cast<int>(rows.size())) {
+            if (dir > 0 && on_history_next_)
+                on_history_next_();
+            return true;
+        }
+
         const Row& to = rows[static_cast<size_t>(target)];
         size_t pos = to.start;
         int w = 0;

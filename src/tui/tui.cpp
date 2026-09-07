@@ -312,6 +312,11 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     std::string last_summary_;
     std::string input_;
 
+    // Prompt history for up/down recall from the input area.
+    std::vector<std::string> prompt_history_;
+    size_t history_pos_ = kNone;
+    std::string history_pending_;
+
     // Command autocomplete state.
     std::vector<std::string> completion_choices_;
     std::string completion_key_;
@@ -511,6 +516,29 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         mark_dirty_locked();
     }
 
+    // Live swarm line rendered from the server reader thread. Thread-safe:
+    // appends under mutex_ and wakes the UI with a Custom event.
+    void swarm_live(const std::string& swarm_text) {
+        flush_live_text();
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            ensure_leading_gap_locked();
+            lines_.push_back(Line{
+                swarm_text,
+                Color::Magenta,
+                false,
+                false
+            });
+            lines_.push_back(Line{""});
+
+            mark_dirty_locked();
+        }
+
+        screen.PostEvent(Event::Custom);
+    }
+
     void header(
         const std::string& provider,
         const std::string& model) override {
@@ -703,6 +731,96 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                 false
             });
 
+        } else if (cmd == "/agents") {
+            if (!agent.swarm_connected()) {
+                append(Line{
+                    "not connected to a swarm server (start one with `zvmh --server start`)",
+                    Color::RedLight,
+                    false,
+                    false
+                });
+            } else {
+                std::vector<nlohmann::json> peers = agent.swarm()->peers();
+
+                std::vector<Line> block;
+                block.push_back(Line{
+                    "swarm agents:",
+                    Color::Cyan,
+                    true,
+                    false
+                });
+
+                if (peers.empty()) {
+                    block.push_back(Line{
+                        "  (none connected yet)",
+                        Color::GrayLight,
+                        false,
+                        false
+                    });
+                } else {
+                    for (const auto& p : peers) {
+                        block.push_back(Line{
+                            "  " + p.value("id", "?") + "  " +
+                                p.value("name", "?") + "  (" +
+                                p.value("repo", "?") + ")",
+                            Color::Default,
+                            false,
+                            false
+                        });
+                    }
+                }
+
+                append_block(std::move(block));
+                agent.swarm()->request_peers();
+            }
+
+        } else if (cmd == "/msg" || cmd.rfind("/msg ", 0) == 0) {
+            std::string rest = trim_string(cmd.substr(4));
+            size_t sp = rest.find(' ');
+
+            if (!agent.swarm_connected()) {
+                append(Line{
+                    "not connected to a swarm server (start one with `zvmh --server start`)",
+                    Color::RedLight,
+                    false,
+                    false
+                });
+            } else if (sp == std::string::npos) {
+                append(Line{
+                    "usage: /msg <all|repo|<agent id>> <text>",
+                    Color::Yellow,
+                    false,
+                    false
+                });
+            } else {
+                std::string to = trim_string(rest.substr(0, sp));
+                std::string text = trim_string(rest.substr(sp + 1));
+
+                if (to != "all" && to != "repo" && !agent.swarm()->knows_peer(to)) {
+                    append(Line{
+                        "no peer with id '" + to + "' is connected (use /agents)",
+                        Color::RedLight,
+                        false,
+                        false
+                    });
+                } else if (text.empty()) {
+                    append(Line{
+                        "usage: /msg <all|repo|<agent id>> <text>",
+                        Color::Yellow,
+                        false,
+                        false
+                    });
+                } else {
+                    agent.swarm()->send_message(to, text);
+                    append(Line{
+                        "msg sent to " + to,
+                        Color::GrayLight,
+                        false,
+                        false
+                    });
+                }
+            }
+
         } else if (cmd == "/help") {
             append_block({
                 Line{
@@ -731,6 +849,18 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                 },
                 Line{
                     "/clear             clear conversation history",
+                    Color::Default,
+                    false,
+                    false
+                },
+                Line{
+                    "/agents            list swarm-connected agents",
+                    Color::Default,
+                    false,
+                    false
+                },
+                Line{
+                    "/msg <to> <text>   message a peer (all, repo, or an agent id)",
                     Color::Default,
                     false,
                     false
@@ -791,7 +921,7 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     // All registered slash commands.
     static const std::vector<std::string>& command_choices() {
         static const std::vector<std::string> choices = {
-            "/model", "/tools", "/clear", "/help", "/exit", "/quit",
+            "/model", "/tools", "/clear", "/agents", "/msg", "/help", "/exit", "/quit",
         };
         return choices;
     }
@@ -802,6 +932,8 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
             {"/model", "show or set the current model"},
             {"/tools", "list registered tools & schemas"},
             {"/clear", "clear conversation history"},
+            {"/agents", "list swarm-connected agents"},
+            {"/msg",    "message an agent (all, repo, or id)"},
             {"/help",  "show this help"},
             {"/exit",  "leave the TUI"},
             {"/quit",  "leave the TUI"},
@@ -962,6 +1094,54 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         }
     }
 
+    void record_history(const std::string& prompt) {
+        if (prompt_history_.empty() ||
+            prompt_history_.back() != prompt) {
+
+            prompt_history_.push_back(prompt);
+
+            if (prompt_history_.size() > 200)
+                prompt_history_.erase(prompt_history_.begin());
+        }
+
+        history_pos_ = kNone;
+        history_pending_.clear();
+    }
+
+    void history_previous() {
+        if (prompt_history_.empty())
+            return;
+
+        if (history_pos_ == kNone) {
+            history_pending_ = input_;
+            history_pos_ = prompt_history_.size() - 1;
+        } else if (history_pos_ > 0) {
+            --history_pos_;
+        } else {
+            return;
+        }
+
+        input_ = prompt_history_[history_pos_];
+        input_cursor_ = static_cast<int>(input_.size());
+        screen.PostEvent(Event::Custom);
+    }
+
+    void history_next() {
+        if (history_pos_ == kNone)
+            return;
+
+        if (history_pos_ + 1 < prompt_history_.size()) {
+            ++history_pos_;
+            input_ = prompt_history_[history_pos_];
+        } else {
+            history_pos_ = kNone;
+            input_ = history_pending_;
+        }
+
+        input_cursor_ = static_cast<int>(input_.size());
+        screen.PostEvent(Event::Custom);
+    }
+
     void submit() {
         if (busy_.load()) {
             append(Line{
@@ -978,6 +1158,8 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
 
         if (prompt.empty())
             return;
+
+        record_history(prompt);
 
         input_.clear();
         input_cursor_ = 0;
@@ -1219,6 +1401,12 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                 input_cursor_,
                 [this] {
                     submit();
+                },
+                [this] {
+                    history_previous();
+                },
+                [this] {
+                    history_next();
                 });
 
         input_component_->TakeFocus();
@@ -1331,6 +1519,13 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                 });
 
         refresh_context();
+
+        if (agent.swarm_connected()) {
+            agent.set_swarm_realtime(
+                [this](const std::string& line) {
+                    swarm_live(line);
+                });
+        }
     }
 
     bool scroll_event(Event event) {
@@ -1463,10 +1658,15 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                         // Already filled in — run it.
                         accept_suggestion();
                         submit();
-                    } else {
-                        // Partial input — fill in the command so the next
-                        // Enter runs it.
+                    } else if (input_.size() < sel.size() &&
+                               sel.rfind(input_, 0) == 0) {
+                        // Partial command word (e.g. "/mg") — fill it in so
+                        // the next Enter runs the completed command.
                         accept_suggestion();
+                    } else {
+                        // Full command with an argument past the suggestion
+                        // (e.g. "/msg all hi") — run it as typed.
+                        submit();
                     }
                     return true;
                 }

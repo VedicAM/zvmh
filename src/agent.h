@@ -1,7 +1,10 @@
 #ifndef AGENT_H
 #define AGENT_H
 
+#include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -9,6 +12,9 @@
 #include "message/message.h"
 #include "tool/registry.h"
 #include "system/registry.h"
+#include "server/client.h"
+#include "tool/msg.h"
+#include "tool/peers.h"
 
 class StreamSink {
 public:
@@ -36,12 +42,28 @@ private:
 
     std::string build_system_prompt(StreamSink& sink);
 
+    std::unique_ptr<swarm::ServerClient> swarm_;
+    std::deque<std::string> swarm_inbox_;
+    std::mutex swarm_inbox_mu_;
+    std::function<void(const std::string&)> swarm_realtime_;
+
+    std::string drain_swarm_text();
+
 public:
     explicit Agent(std::unique_ptr<Provider> provider);
 
     int run_once(const std::string& prompt);
     int run_turn(const std::string& prompt, StreamSink& sink);
     int run_tui();
+
+    // Takes ownership of a connected ServerClient; registers the msg/peers tools
+    // and starts forwarding inbound swarm traffic through the reader thread.
+    void attach_swarm(std::unique_ptr<swarm::ServerClient> client);
+    // Swap the callback invoked (on the reader thread) for each inbound swarm
+    // line; the UI uses this for live rendering, so it must be thread-safe.
+    void set_swarm_realtime(std::function<void(const std::string&)> realtime);
+    bool swarm_connected() const { return swarm_ && swarm_->connected(); }
+    swarm::ServerClient* swarm() const { return swarm_.get(); }
 
     std::string provider_name() const { return provider_->name(); }
     std::string model() const { return provider_->model(); }

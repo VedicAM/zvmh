@@ -116,6 +116,52 @@ int Agent::run_once(const std::string& prompt) {
     return run_turn(prompt, sink);
 }
 
+void Agent::attach_swarm(std::unique_ptr<swarm::ServerClient> client) {
+    if (!client || !client->connected()) {
+        return;
+    }
+    swarm_ = std::move(client);
+    registry_.register_tool<MsgTool>(swarm_.get());
+    registry_.register_tool<PeersTool>(swarm_.get());
+    swarm_->set_handler([this](const std::string& type, const nlohmann::json& msg) {
+        std::string line;
+        if (type == "msg") {
+            line = "[swarm] <" + msg.value("from", "?") + "> " + msg.value("text", "");
+        } else if (type == "conflict") {
+            line = "[swarm] conflict: " + msg.value("path", "") + " was changed by " +
+                   msg.value("by", "?") + " at " + msg.value("at", "?");
+        } else if (type == "shutdown") {
+            line = "[swarm] server went away; swarm disconnected";
+        } else {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(swarm_inbox_mu_);
+            if (swarm_realtime_) swarm_realtime_(line);
+            if (swarm_inbox_.size() < 64) swarm_inbox_.push_back(line);
+        }
+    });
+}
+
+void Agent::set_swarm_realtime(std::function<void(const std::string&)> realtime) {
+    std::lock_guard<std::mutex> lk(swarm_inbox_mu_);
+    swarm_realtime_ = std::move(realtime);
+}
+
+std::string Agent::drain_swarm_text() {
+    std::deque<std::string> items;
+    {
+        std::lock_guard<std::mutex> lk(swarm_inbox_mu_);
+        items.swap(swarm_inbox_);
+    }
+    std::string block;
+    for (auto& line : items) {
+        block += line + "\n";
+    }
+    while (!block.empty() && block.back() == '\n') block.pop_back();
+    return block;
+}
+
 class TurnBridge : public EventSink {
 public:
     TurnBridge(
@@ -152,9 +198,19 @@ private:
 int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
     size_t history_start = messages_.size();
 
+    std::string effective_prompt = prompt;
+    std::string swarm_block = drain_swarm_text();
+    if (!swarm_block.empty()) {
+        effective_prompt =
+            "[swarm notifications received before this turn]\n" + swarm_block +
+            "\n\nIf a file you previously read or edited was reported changed, re-read it and "
+            "reconcile your plan before acting. Handle these, then: " +
+            prompt;
+    }
+
     Message user_msg;
     user_msg.role = Role::User;
-    user_msg.content.push_back(TextBlock{prompt});
+    user_msg.content.push_back(TextBlock{effective_prompt});
     messages_.push_back(user_msg);
 
     const int max_steps = 10;
@@ -213,6 +269,14 @@ int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
                 } catch (const std::exception& e) {
                     result = std::string("Error: ") + e.what();
                     is_error = true;
+                }
+                if (!is_error && swarm_ && swarm_->connected() && tc.input.contains("file_path")) {
+                    std::string fp = tc.input["file_path"].get<std::string>();
+                    if (tc.name == "read") {
+                        swarm_->register_read(fp);
+                    } else if (tc.name == "write" || tc.name == "edit") {
+                        swarm_->report_write(fp);
+                    }
                 }
                 sink.tool_result(result, is_error);
 
