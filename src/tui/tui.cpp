@@ -5,10 +5,12 @@
 #include <limits>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -310,6 +312,11 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     std::string last_summary_;
     std::string input_;
 
+    // Command autocomplete state.
+    std::vector<std::string> completion_choices_;
+    std::string completion_key_;
+    size_t completion_index_ = 0;
+
 
     bool follow_bottom_ = true;
     size_t view_row_ = 0;
@@ -330,6 +337,8 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     Component input_component_;
 
     int input_cursor_ = 0;
+
+    Box prompt_box_;
 
     explicit Impl(Agent& agent_ref)
         : agent(agent_ref) {}
@@ -768,6 +777,155 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         }).detach();
     }
 
+    // The command word currently being typed (i.e. the "/xxx" prefix).
+    // Returns empty when the input is not a slash command.
+    std::string command_prefix() const {
+        const std::string t = trim_string(input_);
+        if (t.empty() || t[0] != '/')
+            return "";
+
+        size_t sp = t.find(' ');
+        return sp == std::string::npos ? t : t.substr(0, sp);
+    }
+
+    // All registered slash commands.
+    static const std::vector<std::string>& command_choices() {
+        static const std::vector<std::string> choices = {
+            "/model", "/tools", "/clear", "/help", "/exit", "/quit",
+        };
+        return choices;
+    }
+
+    // One-line description shown next to each command in the popup.
+    static const char* command_desc(const std::string& name) {
+        static const std::unordered_map<std::string, const char*> desc = {
+            {"/model", "show or set the current model"},
+            {"/tools", "list registered tools & schemas"},
+            {"/clear", "clear conversation history"},
+            {"/help",  "show this help"},
+            {"/exit",  "leave the TUI"},
+            {"/quit",  "leave the TUI"},
+        };
+
+        auto it = desc.find(name);
+        return it == desc.end() ? "" : it->second;
+    }
+
+    // Suggestions matching the command word or its description.
+    std::vector<std::string> current_suggestions() const {
+        const std::string prefix = command_prefix();
+        if (prefix.empty())
+            return {};
+
+        std::vector<std::string> out;
+
+        for (const auto& choice : command_choices()) {
+            // Exact command-word prefix match.
+            if (choice.rfind(prefix, 0) == 0) {
+                out.push_back(choice);
+                continue;
+            }
+
+            // Case-insensitive substring match against the rest of the
+            // command word and its description.
+            const std::string body = prefix.substr(1);
+            if (body.empty())
+                continue;
+
+            auto lower = [](std::string s) {
+                for (char& c : s)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                return s;
+            };
+
+            const std::string lb = lower(body);
+
+            std::string name = lower(choice);
+            std::string desc = lower(command_desc(choice));
+
+            if (name.find(lb) != std::string::npos ||
+                desc.find(lb) != std::string::npos) {
+                out.push_back(choice);
+            }
+        }
+        return out;
+    }
+
+    // Recompute the active completion list, resetting the selected index when
+    // the command word changes.
+    void refresh_suggestions() {
+        std::vector<std::string> fresh = current_suggestions();
+
+        if (!fresh.empty() && command_prefix() != completion_key_) {
+            completion_key_ = command_prefix();
+            completion_index_ = 0;
+        }
+
+        completion_choices_ = std::move(fresh);
+    }
+
+    void accept_suggestion() {
+        if (completion_choices_.empty())
+            return;
+
+        if (completion_index_ >= completion_choices_.size())
+            completion_index_ = completion_choices_.size() - 1;
+
+        input_ = completion_choices_[completion_index_];
+        input_cursor_ = static_cast<int>(input_.size());
+
+        completion_key_ = input_;
+        completion_index_ = 0;
+        completion_choices_ = current_suggestions();
+
+        screen.PostEvent(Event::Custom);
+    }
+
+    bool cycle_suggestion(int dir) {
+        refresh_suggestions();
+        if (completion_choices_.empty())
+            return false;
+
+        const size_t n = completion_choices_.size();
+        completion_index_ =
+            (completion_index_ + n + static_cast<size_t>(dir)) % n;
+
+        screen.PostEvent(Event::Custom);
+        return true;
+    }
+
+    Element suggestions_element() {
+        refresh_suggestions();
+
+        if (completion_choices_.empty())
+            return text("");
+
+        Elements items;
+        for (size_t i = 0; i < completion_choices_.size(); ++i) {
+            const bool sel = (i == completion_index_);
+            const std::string& name = completion_choices_[i];
+            const char* desc = command_desc(name);
+
+            Color text_color =
+                sel ? Color::CyanLight : Color::GrayLight;
+
+            items.push_back(
+                hbox({
+                    text(std::string(sel ? "▸ " : "  ") + name)
+                        | color(text_color) | bold,
+
+                    text("  " + std::string(desc))
+                        | dim
+                        | color(text_color),
+                }));
+        }
+
+        return vbox(std::move(items))
+            | clear_under
+            | borderRounded
+            | color(Color::GrayDark);
+    }
+
     void run_turn_async(const std::string& prompt) {
         busy_.store(true);
         anim_phase_.store(0);
@@ -1080,7 +1238,7 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
 
                     input_component_->Render()
                         | flex,
-                });
+                }) | reflect(prompt_box_);
             });
 
         auto transcript =
@@ -1099,42 +1257,77 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                 container,
                 [this, transcript, prompt_glyph] {
 
-                    return vbox({
-                        hbox({
-                            text(" "),
-                            
+                    Element body =
+                        vbox({
                             hbox({
-                                text("ZVMH")
-                                    | bold
-                                    | color(Color::CyanLight),
+                                text(" "),
+                                
+                                hbox({
+                                    text("ZVMH")
+                                        | bold
+                                        | color(Color::CyanLight),
 
-                                text(" · coding agent")
-                                    | dim,
+                                    text(" · coding agent")
+                                        | dim,
 
-                                filler(),
+                                    filler(),
 
-                                text(
-                                    agent.provider_name() +
-                                    " · " +
-                                    agent.model()
-                                ) | dim,
-                            }) | flex,
+                                    text(
+                                        agent.provider_name() +
+                                        " · " +
+                                        agent.model()
+                                    ) | dim,
+                                }) | flex,
 
-                            text(" "),
+                                text(" "),
+                            }),
+
+                            separatorLight(),
+
+                            transcript->Render()
+                                | flex,
+
+                            separatorLight(),
+
+                            status_element(),
+
+                            prompt_glyph->Render(),
+                        })
+                        | borderRounded;
+
+                    refresh_suggestions();
+
+                    // When a slash command is being typed, float the
+                    // autocomplete popup above the prompt bar, on top of
+                    // everything else on screen.
+                    if (completion_choices_.empty())
+                        return body;
+
+                    // Anchor the popup so its bottom edge sits above the
+                    // prompt bar (status row + separator + prompt height).
+                    int prompt_rows = prompt_box_.y_min >= 0
+                        ? prompt_box_.y_max - prompt_box_.y_min + 1
+                        : 1;
+
+                    const int bottom_margin =
+                        prompt_rows + 1 + 1;
+
+                    return dbox({
+                        body,
+
+                        vbox({
+                            filler(),
+
+                            suggestions_element()
+                                | clear_under,
+
+                            text("")
+                                | size(
+                                    HEIGHT,
+                                    EQUAL,
+                                    bottom_margin),
                         }),
-
-                        separatorLight(),
-
-                        transcript->Render()
-                            | flex,
-
-                        separatorLight(),
-
-                        status_element(),
-
-                        prompt_glyph->Render(),
-                    })
-                    | borderRounded;
+                    });
                 });
 
         refresh_context();
@@ -1242,6 +1435,41 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                 mouse.button == Mouse::WheelDown) {
 
                 return scroll_event(event);
+            }
+        }
+
+        // Command autocomplete handling while the input starts with '/'.
+        if (!input_.empty() && input_[0] == '/') {
+            if (event == Event::Tab) {
+                // Fill in the highlighted suggestion without running it.
+                refresh_suggestions();
+                if (!completion_choices_.empty()) {
+                    accept_suggestion();
+                    return true;
+                }
+            } else if (event == Event::ArrowDown) {
+                if (cycle_suggestion(+1))
+                    return true;
+            } else if (event == Event::ArrowUp) {
+                if (cycle_suggestion(-1))
+                    return true;
+            } else if (event == Event::Return) {
+                refresh_suggestions();
+                if (!completion_choices_.empty()) {
+                    const std::string& sel =
+                        completion_choices_[completion_index_];
+
+                    if (sel == input_) {
+                        // Already filled in — run it.
+                        accept_suggestion();
+                        submit();
+                    } else {
+                        // Partial input — fill in the command so the next
+                        // Enter runs it.
+                        accept_suggestion();
+                    }
+                    return true;
+                }
             }
         }
 

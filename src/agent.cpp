@@ -53,7 +53,7 @@ public:
 }  // namespace
 
 Agent::Agent(std::unique_ptr<Provider> provider)
-    : provider_(std::move(provider)), system_prompt_("You are a helpful assistant.") {
+: provider_(std::move(provider)), system_prompt_("You are an advanced AI coding assistant.\n- Write production-quality code\n- Consider edge cases\n- Optimize for readability\n- Document your approach") {
     register_builtin_tools(registry_);
     sys_context_handles_ = register_system_context_builtins(sys_context_registry_);
 }
