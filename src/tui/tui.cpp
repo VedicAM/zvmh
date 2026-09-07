@@ -101,19 +101,15 @@ std::vector<Line> wrap_line(const Line& line, int limit) {
     if (limit <= 0)
         limit = 100;
 
+    // Keep one cell of breathing room so the final glyph isn't clipped
+    // by the enclosing FTXUI layout/border.
+    const int safe_limit = std::max(1, limit - 1);
+
     std::vector<Line> rows;
     Line row;
     int width = 0;
 
-    auto push_glyph = [&](const std::string& glyph, const Span& style) {
-        const int glyph_width = pe_glyph_width(glyph, 0);
-
-        if (width > 0 && width + glyph_width > limit) {
-            rows.push_back(std::move(row));
-            row = Line{};
-            width = 0;
-        }
-
+    auto append_glyph = [&](const std::string& glyph, const Span& style) {
         if (!row.spans.empty()) {
             Span& last = row.spans.back();
 
@@ -123,14 +119,91 @@ std::vector<Line> wrap_line(const Line& line, int limit) {
                 last.italic == style.italic) {
 
                 last.text += glyph;
-                width += glyph_width;
                 return;
             }
         }
 
-        row.spans.push_back(style);
-        row.spans.back().text = glyph;
-        width += glyph_width;
+        Span new_span = style;
+        new_span.text = glyph;
+        row.spans.push_back(std::move(new_span));
+    };
+
+    auto push_row = [&]() {
+        if (!row.spans.empty()) {
+            rows.push_back(std::move(row));
+            row = Line{};
+            width = 0;
+        }
+    };
+
+    auto add_word =
+        [&](const std::vector<std::pair<std::string, Span>>& glyphs) {
+
+            int word_width = 0;
+
+            for (const auto& [glyph, style] : glyphs)
+                word_width += pe_glyph_width(glyph, 0);
+
+            const bool has_content = width > 0;
+
+            // Word fits on the current line.
+            if (has_content &&
+                width + 1 + word_width <= safe_limit) {
+
+                Span space = glyphs.front().second;
+                append_glyph(" ", space);
+                ++width;
+
+                for (const auto& [glyph, style] : glyphs) {
+                    const int glyph_width =
+                        pe_glyph_width(glyph, 0);
+
+                    append_glyph(glyph, style);
+                    width += glyph_width;
+                }
+
+                return;
+            }
+
+            // Start the word on a new line.
+            if (has_content)
+                push_row();
+
+            // Hard-wrap words that are wider than the available width.
+            if (word_width > safe_limit) {
+                for (const auto& [glyph, style] : glyphs) {
+                    const int glyph_width =
+                        pe_glyph_width(glyph, 0);
+
+                    if (width > 0 &&
+                        width + glyph_width > safe_limit) {
+                        push_row();
+                    }
+
+                    append_glyph(glyph, style);
+                    width += glyph_width;
+                }
+
+                return;
+            }
+
+            // Word fits on an empty line.
+            for (const auto& [glyph, style] : glyphs) {
+                const int glyph_width =
+                    pe_glyph_width(glyph, 0);
+
+                append_glyph(glyph, style);
+                width += glyph_width;
+            }
+        };
+
+    std::vector<std::pair<std::string, Span>> word;
+
+    auto flush_word = [&]() {
+        if (!word.empty()) {
+            add_word(word);
+            word.clear();
+        }
     };
 
     for (const Span& span : line.spans) {
@@ -138,15 +211,21 @@ std::vector<Line> wrap_line(const Line& line, int limit) {
 
         while (i < span.text.size()) {
             const size_t glen = pe_glyph_len(span.text, i);
+            const std::string glyph =
+                span.text.substr(i, glen);
 
-            push_glyph(span.text.substr(i, glen), span);
+            if (glyph == " " || glyph == "\t") {
+                flush_word();
+            } else {
+                word.emplace_back(glyph, span);
+            }
 
             i += glen;
         }
     }
 
-    if (width > 0 || !row.spans.empty())
-        rows.push_back(std::move(row));
+    flush_word();
+    push_row();
 
     if (rows.empty())
         rows.push_back(Line{""});
@@ -460,31 +539,6 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         });
     }
 
-    void summary(
-        const std::string& model,
-        int prompt_tokens,
-        int completion_tokens) override {
-
-        flush_live_text();
-
-        std::string summary =
-            "model: " + model +
-            "  | in: " + std::to_string(prompt_tokens) +
-            "  | out: " + std::to_string(completion_tokens);
-
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_summary_ = summary;
-        }
-
-        append(Line{
-            summary,
-            Color::GrayLight,
-            false,
-            false
-        });
-    }
-
     void tool_call(
         const std::string& name,
         const nlohmann::json& args) override {
@@ -649,7 +703,7 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                     false
                 },
                 Line{
-                    "/model <name>      switch model (e.g. /model openai/gpt-3.5-turbo)",
+                    "/model <name>      switch model (e.g. /model minimax/minimax-m3:free)",
                     Color::Default,
                     false,
                     false
@@ -935,40 +989,68 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         });
     }
 
+    Element usage_element() {
+        const TokenUsage usage = agent.usage();
+
+        const int in_tokens = usage.prompt_tokens;
+        const int out_tokens = usage.completion_tokens;
+
+        auto format_tokens = [](int tokens) -> std::string {
+            if (tokens >= 1000000) {
+                return std::to_string(tokens / 1000000) + "." +
+                    std::to_string((tokens / 100000) % 10) + "m";
+            }
+
+            if (tokens >= 1000) {
+                return std::to_string(tokens / 1000) + "." +
+                    std::to_string((tokens / 100) % 10) + "k";
+            }
+
+            return std::to_string(tokens);
+        };
+
+        return hbox({
+            text(format_tokens(in_tokens) + " in")
+                | dim,
+
+            text(" · ")
+                | dim,
+
+            text(format_tokens(out_tokens) + " out")
+                | dim,
+
+            text(" · ")
+                | dim,
+
+            text(agent.model())
+                | dim,
+        });
+    }
+
     Element status_element() {
         std::lock_guard<std::mutex> lock(mutex_);
 
+        Element left;
+
         if (busy_.load()) {
-            return hbox({
-                loading_element(),
-
-                filler(),
-
-                context_element()
-                    | size(WIDTH, LESS_THAN, 30),
-
-                filler(),
-
-                text(last_summary_)
-                    | size(WIDTH, LESS_THAN, 60)
-                    | dim,
-            });
+            left = loading_element();
+        } else {
+            left = text("○ idle")
+                | color(Color::Green);
         }
 
         return hbox({
-            text("○ idle")
-                | color(Color::Green),
+            text(" "),
 
-            filler(),
+            hbox({
+                left,
 
-            context_element()
-                | size(WIDTH, LESS_THAN, 30),
+                filler(),
 
-            filler(),
+                usage_element(),
+            }) | flex,
 
-            text(last_summary_)
-                | size(WIDTH, LESS_THAN, 60)
-                | dim,
+            text(" "),
         });
     }
 
@@ -1019,20 +1101,26 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
 
                     return vbox({
                         hbox({
-                            text(" ZVMH ")
-                                | bold
-                                | color(Color::CyanLight),
+                            text(" "),
+                            
+                            hbox({
+                                text("ZVMH")
+                                    | bold
+                                    | color(Color::CyanLight),
 
-                            text("· coding agent ")
-                                | dim,
+                                text(" · coding agent")
+                                    | dim,
 
-                            filler(),
+                                filler(),
 
-                            text(
-                                agent.provider_name() +
-                                " · " +
-                                agent.model()
-                            ) | dim,
+                                text(
+                                    agent.provider_name() +
+                                    " · " +
+                                    agent.model()
+                                ) | dim,
+                            }) | flex,
+
+                            text(" "),
                         }),
 
                         separatorLight(),
@@ -1171,9 +1259,12 @@ Tui::Tui(Agent& agent)
     impl_->setup();
 }
 
-Tui::~Tui() = default;
+Tui::~Tui(){
+    std::cout << "\x1b[<u" << std::flush;
+};
 
 int Tui::run() {
+    std::cout << "\x1b[>1u" << std::flush;
     impl_->screen.Loop(impl_);
     return 0;
 }

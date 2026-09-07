@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <iostream>
 
 #include <ftxui/component/component_base.hpp>
 #include <ftxui/component/event.hpp>
@@ -238,37 +239,55 @@ private:
     bool Focusable() const override { return true; }
 
     bool OnEvent(Event event) override {
+        // Enter = submit
         if (event == Event::Return) {
             on_submit_();
             return true;
         }
-        if (event == Event::Special("\x1B[13;2u") ||
-            event == Event::Special("\x1B[13;2~")) {
+
+        // Shift+Enter — modifyOtherKeys variant
+            if (event.input() == "\x1b\r") {
+                content_.insert(static_cast<size_t>(cursor_), "\n");
+                ++cursor_;
+                return true;
+            }
+
+
+
+
+        // Ctrl+J = newline
+        if (event.is_character() && event.character() == "\n") {
             content_.insert(static_cast<size_t>(cursor_), "\n");
-            cursor_ += 1;
+            ++cursor_;
             return true;
         }
+
         if (event.is_character()) {
             const std::string& c = event.character();
             content_.insert(static_cast<size_t>(cursor_), c);
             cursor_ += static_cast<int>(c.size());
             return true;
         }
+
         if (event == Event::Backspace) return handle_backspace();
         if (event == Event::Delete) return handle_delete();
         if (event == Event::ArrowLeft) return handle_arrow_horizontal(-1);
         if (event == Event::ArrowRight) return handle_arrow_horizontal(+1);
         if (event == Event::ArrowUp) return handle_vertical(-1);
         if (event == Event::ArrowDown) return handle_vertical(+1);
+
         if (event == Event::Home) {
             handle_home_end(true);
             return true;
         }
+
         if (event == Event::End) {
             handle_home_end(false);
             return true;
         }
+
         if (event.is_mouse()) return handle_mouse(event);
+
         return false;
     }
 

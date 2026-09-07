@@ -163,8 +163,6 @@ int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
         std::string system_prompt = build_system_prompt(sink);
 
         for (int step = 0; step < max_steps; ++step) {
-            sink.header(provider_->name(), provider_->model());
-
             std::string response_text;
             std::vector<ActiveToolCall> tool_calls;
             std::map<int, int> tool_index;  // api delta index -> tool_calls position

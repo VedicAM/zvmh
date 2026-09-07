@@ -1,7 +1,7 @@
 #include "openrouter.h"
 #include <cpr/cpr.h>
 
-OpenRouter::OpenRouter(const std::string& api_key) : Provider(api_key, "openai/gpt-3.5-turbo") {}
+OpenRouter::OpenRouter(const std::string& api_key) : Provider(api_key, "minimax/minimax-m3:free") {}
 
 static std::string api_url() {
     const char* base = getenv("OPENROUTER_BASE_URL");
