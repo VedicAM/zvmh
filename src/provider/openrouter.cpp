@@ -1,7 +1,7 @@
 #include "openrouter.h"
 #include <cpr/cpr.h>
 
-OpenRouter::OpenRouter(const std::string& api_key) : Provider(api_key, "minimax/minimax-m3:free") {}
+OpenRouter::OpenRouter(const std::string& api_key) : Provider(api_key, "inclusionai/ling-3.0-flash-vl:free") {}
 
 static std::string api_url() {
     const char* base = getenv("OPENROUTER_BASE_URL");
@@ -213,6 +213,9 @@ void OpenRouter::complete(
     session.SetHeader(cpr::Header{
         {"Authorization", "Bearer " + api_key_},
         {"Content-Type", "application/json"},
+        {"HTTP-Referer", "https://github.com/VedicAM/zvmh"},
+        {"X-Title", "zvmh"},
+        {"X-OpenRouter-Categories", "cli-agent"},
     });
     session.SetBody(cpr::Body{request_body.dump()});
 

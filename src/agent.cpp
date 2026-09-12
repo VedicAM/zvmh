@@ -13,42 +13,131 @@ struct ActiveToolCall {
 };
 
 namespace {
+
+// Collapse runs of whitespace (including newlines) into single spaces so a
+// whole tool result fits on one display row.
+std::string collapse_ws(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool prev_space = false;
+    for (char c : s) {
+        if (c == '\n' || c == '\r' || c == '\t' || c == ' ') {
+            if (!prev_space) out.push_back(' ');
+            prev_space = true;
+        } else {
+            out.push_back(c);
+            prev_space = false;
+        }
+    }
+    if (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+std::string clamp_front(const std::string& s, size_t max) {
+    if (s.size() <= max) return s;
+    return s.substr(0, max) + "…";
+}
+
+std::string clamp_tail(const std::string& s, size_t max) {
+    if (s.size() <= max) return s;
+    return "…" + s.substr(s.size() - max);
+}
+
+// Primary user-facing argument for the tool-call decoration ("read [file]").
+std::string tool_argument(const nlohmann::json& args) {
+    static const char* keys[] = {"file_path", "command", "pattern", "path"};
+    for (const char* key : keys) {
+        auto it = args.find(key);
+        if (it != args.end() && it->is_string()) {
+            std::string v = it->get<std::string>();
+            if (!v.empty()) return clamp_front(collapse_ws(v), 64);
+        }
+    }
+    return "";
+}
+
+// Outcome preview shown instead of the full tool result. The model still gets
+// the complete result in its history; only the user-facing sink sees this
+// compact one-liner, keyed off the tool name.
+std::string make_tool_preview(const std::string& name,
+                              const std::string& result,
+                              bool is_error) {
+    if (is_error)
+        return clamp_front(collapse_ws(result), 220);
+
+    if (name == "read") {
+        size_t lines = 0;
+        for (char c : result)
+            if (c == '\n') ++lines;
+        if (!result.empty() && result.back() != '\n') ++lines;
+        return std::to_string(lines) + " lines";
+    }
+
+    if (name == "grep") {
+        size_t matches = 0;
+        for (char c : result)
+            if (c == '\n') ++matches;
+        if (matches == 0)
+            return "no matches";
+        return std::to_string(matches) +
+            (matches == 1 ? " match" : " matches");
+    }
+
+    if (name == "bash") {
+        std::string out = collapse_ws(result);
+        if (out.empty()) return "ok";
+        return clamp_tail(out, 160);
+    }
+
+    return clamp_front(collapse_ws(result), 160);
+}
+
 class StdoutSink : public StreamSink {
 public:
     void header(const std::string& provider, const std::string& model) override {
         std::cout << "\n  \033[2m[" << provider << " · " << model << "]\033[0m\n";
+        line_open_ = false;
     }
     void text_delta(const std::string& text) override {
         std::cout << text << std::flush;
+        line_open_ = !text.empty() && text.back() != '\n';
     }
-    void tool_start(const std::string& name) override {
-        std::cout << "\n\n  \033[36m→ \033[1m" << name << "\033[0m\n";
+    void tool_start(const std::string&) override {
+        // Folded into tool_call: one line per invocation with the bundled
+        // argument, result preview appended to the same line.
+    }
+    void tool_call(const std::string& name, const nlohmann::json& args) override {
+        if (line_open_)
+            std::cout << "\n";
+        std::string display = "  \033[33m▸ \033[1m" + name + "\033[0m";
+        std::string arg = tool_argument(args);
+        if (!arg.empty())
+            display += " \033[2m[" + arg + "]\033[0m";
+        std::cout << display << std::flush;
+        line_open_ = true;
+    }
+    void tool_result(const std::string& preview, bool is_error) override {
+        std::string color = is_error ? "\033[31m" : "\033[90m";
+        std::cout << " \033[2m·\033[0m " << color << preview << "\033[0m\n" << std::flush;
+        line_open_ = false;
     }
     void summary(const std::string& model, int prompt_tokens, int completion_tokens) override {
         std::cout << "  \033[2m" << std::string(52, '-') << "\033[0m\n"
                   << "  \033[2mmodel: \033[0m" << model
                   << "  \033[2m| tokens in: \033[0m" << prompt_tokens
                   << "  \033[2m| out: \033[0m" << completion_tokens << "\n";
-    }
-    void tool_call(const std::string& name, const nlohmann::json& args) override {
-        std::cout << "  \033[33m▸ \033[1m" << name << "\033[0m " << args.dump() << "\n";
-    }
-    void tool_result(const std::string& result, bool is_error) override {
-        if (is_error) {
-            std::cerr << "  \033[31m" << result << "\033[0m\n";
-            return;
-        }
-        std::string display = result;
-        if (display.size() > 220) {
-            display = display.substr(0, 220) + "...\n";
-        } else if (!display.empty() && display.back() != '\n') {
-            display += "\n";
-        }
-        std::cout << "  \033[32m↩ \033[0m" << display << "\n";
+        line_open_ = false;
     }
     void warning(const std::string& text) override {
         std::cerr << "  \033[31m" << text << "\033[0m\n";
+        line_open_ = false;
     }
+
+private:
+    // True while the last emitted bytes sit mid-row without a trailing \n,
+    // so the next tool line can start on a fresh row without inserting a
+    // blank one between consecutive tool calls.
+    bool line_open_ = false;
 };
 }  // namespace
 
@@ -313,7 +402,7 @@ int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
                         swarm_->report_write(fp);
                     }
                 }
-                sink.tool_result(result, is_error);
+                sink.tool_result(make_tool_preview(tc.name, result, is_error), is_error);
 
                 Message tool_msg;
                 tool_msg.role = Role::User;

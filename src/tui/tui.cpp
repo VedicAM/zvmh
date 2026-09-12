@@ -43,6 +43,43 @@ std::string trim_string(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
+// Collapse runs of whitespace (including newlines) into single spaces so a
+// whole tool result fits on one display row.
+std::string collapse_ws(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool prev_space = false;
+    for (char c : s) {
+        if (c == '\n' || c == '\r' || c == '\t' || c == ' ') {
+            if (!prev_space) out.push_back(' ');
+            prev_space = true;
+        } else {
+            out.push_back(c);
+            prev_space = false;
+        }
+    }
+    if (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+std::string clamp_front(const std::string& s, size_t max) {
+    if (s.size() <= max) return s;
+    return s.substr(0, max) + "…";
+}
+
+// Primary user-facing argument for the tool-call decoration ("read [file]").
+std::string tool_argument(const nlohmann::json& args) {
+    static const char* keys[] = {"file_path", "command", "pattern", "path"};
+    for (const char* key : keys) {
+        auto it = args.find(key);
+        if (it != args.end() && it->is_string()) {
+            std::string v = it->get<std::string>();
+            if (!v.empty()) return clamp_front(collapse_ws(v), 64);
+        }
+    }
+    return "";
+}
+
 // A row counts as blank when it carries no visible glyphs.
 bool line_is_blank(const Line& line) {
     for (const Span& span : line.spans) {
@@ -309,6 +346,11 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     size_t live_count_ = 0;
     std::string live_text_;
 
+    // Tool-call display: one line per invocation; the result preview is
+    // appended in place when it arrives.
+    bool tool_result_pending_ = false;
+    size_t tool_line_index_ = kNone;
+
     std::string last_summary_;
     std::string input_;
 
@@ -565,41 +607,82 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         screen.PostEvent(Event::Custom);
     }
 
-    void tool_start(const std::string& name) override {
-        flush_live_text();
-
-        append(Line{
-            "→ " + name,
-            Color::Cyan,
-            true,
-            false
-        });
+    void tool_start(const std::string&) override {
+        // Folded into tool_call: the TUI shows one line per invocation once
+        // the call is confirmed, to avoid → name / ▸ name / ↩ result clutter.
     }
 
     void tool_call(
         const std::string& name,
         const nlohmann::json& args) override {
 
-        (void)args;
+        flush_live_text();
 
-        append(Line{
-            "▸ " + name,
-            Color::Yellow,
-            true,
-            false
-        });
+        std::string display = "▸ " + name;
+        std::string arg = tool_argument(args);
+        if (!arg.empty())
+            display += " [" + arg + "]";
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            // No leading gap: consecutive tool calls sit flush against each
+            // other. Separation from surrounding text comes from the blank
+            // rows that end the prompt and text blocks.
+            lines_.push_back(Line{
+                display,
+                Color::Yellow,
+                true,
+                false
+            });
+
+            tool_line_index_ = lines_.size() - 1;
+            tool_result_pending_ = true;
+
+            mark_dirty_locked();
+        }
+
+        screen.PostEvent(Event::Custom);
     }
 
     void tool_result(
-        const std::string& result,
+        const std::string& preview,
         bool is_error) override {
 
-        append(Line{
-            "↩ " + result,
-            is_error ? Color::RedLight : Color::Green,
-            false,
-            false
-        });
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            if (tool_result_pending_ &&
+                tool_line_index_ < lines_.size()) {
+
+                lines_[tool_line_index_].spans.emplace_back(Span{
+                    " · " + preview,
+                    is_error ? Color::RedLight : Color::GrayLight,
+                    false,
+                    !is_error,
+                    false
+                });
+
+                tool_result_pending_ = false;
+                tool_line_index_ = kNone;
+
+                mark_dirty_locked();
+            } else {
+                // No tracked line (e.g. result without a call): fall back to
+                // a standalone row rather than silently dropping it.
+                ensure_leading_gap_locked();
+                lines_.push_back(Line{
+                    "↩ " + preview,
+                    is_error ? Color::RedLight : Color::Green,
+                    false,
+                    false
+                });
+
+                mark_dirty_locked();
+            }
+        }
+
+        screen.PostEvent(Event::Custom);
     }
 
     void warning(const std::string& text) override {
@@ -1170,7 +1253,7 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         }
 
         append(Line{
-            prompt,
+            "> " + prompt,
             Color::BlueLight,
             true,
             false
