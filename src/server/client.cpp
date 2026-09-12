@@ -165,6 +165,23 @@ bool ServerClient::request_peers() {
     return send_json(fd_, agents_req());
 }
 
+bool ServerClient::send_prompt(const std::string& text) {
+    if (text.empty()) return false;
+    std::lock_guard<std::mutex> lk(send_mu_);
+    return send_json(fd_, prompt_req(text));
+}
+
+bool ServerClient::send_clear() {
+    std::lock_guard<std::mutex> lk(send_mu_);
+    return send_json(fd_, clear_req());
+}
+
+bool ServerClient::send_model(const std::string& model) {
+    if (model.empty()) return false;
+    std::lock_guard<std::mutex> lk(send_mu_);
+    return send_json(fd_, model_req(model));
+}
+
 void ServerClient::disconnect() {
     int fd = fd_;
     if (running_.exchange(false)) {

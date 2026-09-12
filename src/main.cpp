@@ -11,10 +11,11 @@
 #include <thread>
 #include <unistd.h>
 
-#include "agent.h"
-#include "provider/openrouter.h"
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
+#include "remote/remote_agent.h"
 #include "server/server.h"
-#include "server/client.h"
 #include "system/builtins.h"
 
 using namespace std;
@@ -26,6 +27,7 @@ struct Args {
     string addr = "127.0.0.1";
     int port = 5500;
     int poll_ms = 2000;
+    bool session = false;
     bool daemon = false;
     string pidfile;
     string connect_host;     // set when --connect given
@@ -44,12 +46,16 @@ void print_usage() {
          << "  --server <start|stop|status> Operate the swarm daemon\n"
          << "      --addr <HOST>            Bind address (default 127.0.0.1)\n"
          << "      --port <PORT>            Bind port (default 5500)\n"
+         << "      --session                Target the auto-provisioned session daemon instead\n"
+         << "                               (port 5501, ~/.zvmh/session.pid); also used by the\n"
+         << "                               solo-session spawn when no --connect is given\n"
          << "      --poll-ms <MS>           Filesystem poll interval (default 2000)\n"
          << "      --daemon                 Fork into the background (start only)\n"
          << "      --pidfile <FILE>         Override pidfile path (default ~/.zvmh/server.pid)\n"
          << "\n"
          << "Swarm client:\n"
-         << "  --connect <HOST[:PORT]>      Join a swarm server; usable with -m or TUI\n";
+         << "  --connect <HOST[:PORT]>      Join a swarm server; unusable at a session endpoint\n"
+         << "                               that has no daemon yet, spawns one automatically\n";
 }
 
 filesystem::path default_dir() {
@@ -61,8 +67,16 @@ filesystem::path default_pidfile(const Args& a) {
     return a.pidfile.empty() ? default_dir() / "server.pid" : filesystem::path(a.pidfile);
 }
 
+filesystem::path session_pidfile() {
+    return default_dir() / "session.pid";
+}
+
 filesystem::path default_logfile() {
     return default_dir() / "server.log";
+}
+
+filesystem::path session_logfile() {
+    return default_dir() / "session.log";
 }
 
 bool process_alive(pid_t pid) {
@@ -79,8 +93,24 @@ pid_t read_pid(const filesystem::path& pidfile) {
     return static_cast<pid_t>(pid);
 }
 
-int run_server(const Args& a, const filesystem::path& pidfile) {
-    swarm::SwarmsServer server(a.addr, a.port, a.poll_ms);
+// TCP connect probe: does anything answer on host:port right now?
+bool port_alive(const string& host, int port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(static_cast<unsigned short>(port));
+    bool ok = ::inet_pton(AF_INET, host.c_str(), &sa.sin_addr) == 1 &&
+              ::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0;
+    ::close(fd);
+    return ok;
+}
+
+int run_server(const Args& a, const filesystem::path& pidfile,
+               const filesystem::path& logfile) {
+    int port = a.session ? swarm::kSessionPort : a.port;
+    const char* key = getenv("OPENROUTER_API_KEY");
+    swarm::SwarmsServer server(a.addr, port, a.poll_ms, key ? key : "", a.session);
 
     if (a.daemon) {
         if (filesystem::exists(pidfile)) {
@@ -107,7 +137,7 @@ int run_server(const Args& a, const filesystem::path& pidfile) {
         }
 
         setsid();
-        int logfd = ::open(default_logfile().c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        int logfd = ::open(logfile.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (logfd >= 0) {
             dup2(logfd, STDOUT_FILENO);
             dup2(logfd, STDERR_FILENO);
@@ -131,7 +161,9 @@ int run_server(const Args& a, const filesystem::path& pidfile) {
 }
 
 int cmd_server(const Args& a) {
-    filesystem::path pidfile = default_pidfile(a);
+    filesystem::path pidfile = a.session ? session_pidfile() : default_pidfile(a);
+    filesystem::path logfile = a.session ? session_logfile() : default_logfile();
+    int port = a.session ? swarm::kSessionPort : a.port;
     pid_t existing = read_pid(pidfile);
 
     if (a.server_cmd == "start") {
@@ -140,12 +172,14 @@ int cmd_server(const Args& a) {
             return 1;
         }
         if (!a.daemon) {
-            cerr << "Swarm server listening on " << a.addr << ":" << a.port
+            cerr << (a.session ? "Session server" : "Swarm server")
+                 << " listening on " << a.addr << ":" << port
                  << " (Ctrl-C to stop; use --daemon to background)\n";
         } else {
-            cout << "Swarm server starting on " << a.addr << ":" << a.port << " (pid " << getpid() << ")\n";
+            cout << (a.session ? "Session server" : "Swarm server")
+                 << " starting on " << a.addr << ":" << port << " (pid " << getpid() << ")\n";
         }
-        return run_server(a, pidfile);
+        return run_server(a, pidfile, logfile);
     }
     if (a.server_cmd == "stop") {
         if (existing <= 0 || !process_alive(existing)) {
@@ -175,7 +209,8 @@ int cmd_server(const Args& a) {
     }
     if (a.server_cmd == "status") {
         if (existing > 0 && process_alive(existing)) {
-            cout << "Server is running (pid " << existing << ", " << a.addr << ":" << a.port << ")\n";
+            cout << (a.session ? "Session server" : "Swarm server")
+                 << " is running (pid " << existing << ", " << a.addr << ":" << port << ")\n";
             return 0;
         }
         cout << "Server is not running\n";
@@ -183,6 +218,77 @@ int cmd_server(const Args& a) {
     }
     cerr << "Error: unknown --server command '" << a.server_cmd << "'\n";
     return 1;
+}
+
+// Boot a per-session backend on kSessionPort if nothing answers there yet.
+// The daemon inherits our cwd and OPENROUTER_API_KEY, self-terminates when its
+// last client disconnects, and keeps a pidfile for explicit `--server stop
+// --session`. Requires an API key (a swarm-only daemon is only useful when the
+// user opts into a shared server explicitly).
+int ensure_session_backend(const Args& a) {
+    if (port_alive(swarm::kSessionHost, swarm::kSessionPort)) {
+        return 0;
+    }
+
+    const char* key = getenv("OPENROUTER_API_KEY");
+    if (!key || !*key) {
+        cerr << "Error: OPENROUTER_API_KEY is not set; no session backend to run prompts.\n"
+             << "  Start a shared server instead and connect to it with\n"
+             << "    zvmh --connect " << swarm::kDefaultHost << ":" << swarm::kDefaultPort << "\n"
+             << "  or export OPENROUTER_API_KEY to auto-spawn a session daemon.\n";
+        return 1;
+    }
+
+    filesystem::path pidfile = session_pidfile();
+    filesystem::create_directories(pidfile.parent_path());
+
+    if (filesystem::exists(pidfile)) {
+        pid_t stale = read_pid(pidfile);
+        if (stale <= 0 || !process_alive(stale)) {
+            filesystem::remove(pidfile);
+        }
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        cerr << "Error: fork failed: " << strerror(errno) << "\n";
+        return 1;
+    }
+    if (pid > 0) {
+        // Parent: wait for the daemon to start listening.
+        for (int i = 0; i < 120; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (port_alive(swarm::kSessionHost, swarm::kSessionPort)) {
+                return 0;
+            }
+        }
+        cerr << "Error: session backend did not start on "
+             << swarm::kSessionHost << ":" << swarm::kSessionPort << "\n";
+        return 1;
+    }
+
+    // Child: the session daemon.
+    setsid();
+    int logfd = ::open(session_logfile().c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (logfd >= 0) {
+        dup2(logfd, STDOUT_FILENO);
+        dup2(logfd, STDERR_FILENO);
+        ::close(logfd);
+    }
+    int nullfd = ::open("/dev/null", O_RDONLY);
+    if (nullfd >= 0) {
+        dup2(nullfd, STDIN_FILENO);
+        ::close(nullfd);
+    }
+    {
+        ofstream pf(pidfile);
+        pf << getpid() << std::flush;
+    }
+    swarm::SwarmsServer server(swarm::kSessionHost, swarm::kSessionPort, a.poll_ms, key, true);
+    int rc = server.run();
+    filesystem::remove(pidfile);
+    ::_exit(rc);
+    return rc;
 }
 
 bool parse_args(int argc, char* argv[], Args& args) {
@@ -225,6 +331,8 @@ bool parse_args(int argc, char* argv[], Args& args) {
                 cerr << "Error: invalid --port value\n";
                 return false;
             }
+        } else if (arg == "--session") {
+            args.session = true;
         } else if (arg == "--poll-ms") {
             if (i + 1 >= argc) return false;
             try {
@@ -265,34 +373,10 @@ bool parse_args(int argc, char* argv[], Args& args) {
     return true;
 }
 
-unique_ptr<Provider> create_provider() {
-    const char* api_key = getenv("OPENROUTER_API_KEY");
-    if (!api_key) {
-        cerr << "Error: OPENROUTER_API_KEY environment variable not set\n";
-        return nullptr;
-    }
-    return make_unique<OpenRouter>(api_key);
-}
-
-int join_swarm(const Args& args, Agent& agent) {
-    auto client = make_unique<swarm::ServerClient>(args.connect_host, args.connect_port);
-    filesystem::path cwd = filesystem::current_path();
-    filesystem::path root = sysctx::find_vcs_root(cwd);
-    string repo = (root.empty() ? cwd : root).string();
-
+std::string session_agent_name() {
     char hostbuf[256] = {0};
     gethostname(hostbuf, sizeof(hostbuf) - 1);
-    string name = string("zvmh-") + hostbuf + "-" + to_string(getpid());
-
-    if (!client->connect(repo, name)) {
-        cerr << "Error: could not connect to swarm server at " << args.connect_host << ":"
-             << args.connect_port << "\n";
-        return 1;
-    }
-    cerr << "Connected to swarm server at " << args.connect_host << ":" << args.connect_port
-         << " (id " << client->id() << ")\n";
-    agent.attach_swarm(std::move(client));
-    return 0;
+    return string("zvmh-") + hostbuf + "-" + to_string(getpid());
 }
 
 int main(int argc, char* argv[]) {
@@ -319,27 +403,31 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    auto provider = create_provider();
-    if (!provider) {
+    // Every session is a thin client. Without --connect we auto-provision a
+    // session daemon on 127.0.0.1:5501 that we attach to.
+    if (args.connect_host.empty()) {
+        if (ensure_session_backend(args) != 0) {
+            return 1;
+        }
+        args.connect_host = swarm::kSessionHost;
+        args.connect_port = swarm::kSessionPort;
+    }
+
+    filesystem::path cwd = filesystem::current_path();
+    filesystem::path root = sysctx::find_vcs_root(cwd);
+    string repo = (root.empty() ? cwd : root).string();
+
+    remote::RemoteAgent agent(args.connect_host, args.connect_port);
+    if (!agent.connect(repo, session_agent_name())) {
+        cerr << "Error: could not connect to server at "
+             << args.connect_host << ":" << args.connect_port << "\n";
         return 1;
     }
 
-    Agent agent(std::move(provider));
-
-    if (!args.connect_host.empty()) {
-        if (join_swarm(args, agent) != 0) {
-            return 1;
-        }
-        if (!args.message.empty()) {
-            agent.set_swarm_realtime([](const string& line) {
-                cerr << "  " << line << "\n";
-            });
-            return agent.run_once(args.message);
-        }
-        return agent.run_tui();
-    }
-
     if (!args.message.empty()) {
+        agent.set_swarm_realtime([](const string& line) {
+            cerr << "  " << line << "\n";
+        });
         return agent.run_once(args.message);
     }
 

@@ -7,11 +7,18 @@
 #include <csignal>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <netdb.h>
 #include <random>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
+
+#include <nlohmann/json.hpp>
+
+#include "../provider/openrouter.h"
+#include "wire_sink.h"
 
 #ifndef SOCK_CLOEXEC
 #define SOCK_CLOEXEC 0
@@ -35,6 +42,67 @@ std::string random_hex_id() {
     return s;
 }
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// PeerView — in-process swarm view for a server-hosted agent.
+// ---------------------------------------------------------------------------
+
+SwarmsServer::PeerView::PeerView(SwarmsServer* owner, std::string client_id)
+    : owner_(owner), client_id_(std::move(client_id)) {}
+
+void SwarmsServer::PeerView::set_handler(MessageHandler handler) {
+    std::lock_guard<std::mutex> lk(mu_);
+    handler_ = std::move(handler);
+}
+
+void SwarmsServer::PeerView::inject(const std::string& type, const nlohmann::json& msg) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (handler_) handler_(type, msg);
+}
+
+bool SwarmsServer::PeerView::knows_peer(const std::string& id) const {
+    std::lock_guard<std::mutex> lk(owner_->mu_);
+    return id != client_id_ && owner_->clients_.count(id) != 0;
+}
+
+bool SwarmsServer::PeerView::send_message(const std::string& to, const std::string& text) {
+    if (to.empty() || text.empty()) return false;
+    owner_->route_message(client_id_, to, text);
+    return true;
+}
+
+bool SwarmsServer::PeerView::request_peers() {
+    return true;
+}
+
+std::vector<nlohmann::json> SwarmsServer::PeerView::peers() const {
+    std::lock_guard<std::mutex> lk(owner_->mu_);
+    std::vector<nlohmann::json> out;
+    for (const auto& [pid, pc] : owner_->clients_) {
+        if (pid != client_id_) out.push_back(agent_info(pid, pc.name, pc.repo));
+    }
+    return out;
+}
+
+bool SwarmsServer::PeerView::register_read(const std::string& path) {
+    std::string hash = hash_file(path);
+    if (hash.empty()) return false;
+    std::lock_guard<std::mutex> lk(owner_->mu_);
+    owner_->read_hashes_[path][client_id_] = hash;
+    owner_->refresh_watch_locked(path);
+    return true;
+}
+
+bool SwarmsServer::PeerView::report_write(const std::string& path) {
+    std::string hash = hash_file(path);
+    if (hash.empty()) return false;
+    owner_->notify_file_changed(path, hash, client_id_, now_iso());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Socket plumbing.
+// ---------------------------------------------------------------------------
 
 int SwarmsServer::listen_socket() {
     std::string port_str = std::to_string(port_);
@@ -109,21 +177,22 @@ void SwarmsServer::notify_file_changed(const std::string& path, const std::strin
         std::lock_guard<std::mutex> lk(mu_);
         update_conflict_state_locked(path, new_hash, by, at, notify);
     }
-    for (auto& id : notify) {
-        send_to(id, conflict_notice(path, by, at, new_hash));
+    nlohmann::json notice = conflict_notice(path, by, at, new_hash);
+    for (const auto& id : notify) {
+        deliver_inbox(id, "conflict", notice);
     }
 }
 
-void SwarmsServer::send_to(const std::string& id, const nlohmann::json& msg) {
+bool SwarmsServer::send_to(const std::string& id, const nlohmann::json& msg) {
     int fd = -1;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = clients_.find(id);
-        if (it == clients_.end() || it->second.fd < 0) return;
+        if (it == clients_.end() || it->second.fd < 0) return false;
         fd = it->second.fd;
     }
     std::lock_guard<std::mutex> lk(send_mu_);
-    send_json(fd, msg);
+    return send_json(fd, msg);
 }
 
 void SwarmsServer::remove_client_locked(const std::string& id) {
@@ -140,7 +209,207 @@ void SwarmsServer::remove_client_locked(const std::string& id) {
         if (vec.empty()) repo_members_.erase(members);
     }
     clients_.erase(it);
+
+    auto ait = agents_.find(id);
+    if (ait != agents_.end() && !ait->second.busy) {
+        agents_.erase(ait);
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Agent-slot lifecycle (server-hosted runtime).
+// ---------------------------------------------------------------------------
+
+void SwarmsServer::hello_register(const std::string& id, const std::string& name,
+                                   const std::string& repo, int fd,
+                                   std::vector<nlohmann::json>& peers) {
+    clients_[id] = Client{id, name, repo, fd};
+    repo_members_[repo].push_back(id);
+    for (const auto& [pid, pc] : clients_) {
+        peers.push_back(agent_info(pid, pc.name, pc.repo));
+    }
+}
+
+void SwarmsServer::create_agent_slot(const std::string& id, const std::string& repo) {
+    std::unique_ptr<OpenRouter> provider;
+    if (!api_key_.empty()) {
+        provider = std::make_unique<OpenRouter>(api_key_);
+    }
+
+    AgentSlot slot;
+    slot.agent = std::make_unique<Agent>(std::move(provider));
+    slot.agent->set_tool_cwd_base(repo);
+    slot.agent->attach_swarm(std::make_unique<PeerView>(this, id), true);
+
+    std::lock_guard<std::mutex> lk(mu_);
+    agents_[id] = std::move(slot);
+    agents_[id].peer_view = nullptr;  // owned by the Agent's swarm_ member
+}
+
+void SwarmsServer::send_state(const std::string& id) {
+    std::string provider;
+    std::string model;
+    std::vector<nlohmann::json> tools;
+    int ctx_total = -1;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto ait = agents_.find(id);
+        if (ait == agents_.end()) return;
+        Agent& agent = *ait->second.agent;
+        provider = agent.provider_name();
+        model = agent.model();
+        ctx_total = agent.context_window();
+        for (const auto& def : agent.tools()) {
+            tools.push_back({{"name", def.name},
+                             {"description", def.description},
+                             {"parameters", def.input_schema}});
+        }
+    }
+    send_to(id, state_packet(provider, model, tools, ctx_total));
+}
+
+void SwarmsServer::clear_agent_history(const std::string& id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto ait = agents_.find(id);
+    if (ait == agents_.end()) return;
+    ait->second.agent->clear_messages();
+}
+
+void SwarmsServer::set_agent_model(const std::string& id, const std::string& model) {
+    if (model.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto ait = agents_.find(id);
+        if (ait == agents_.end()) return;
+        ait->second.agent->set_model(model);
+    }
+    send_state(id);
+}
+
+void SwarmsServer::schedule_prompt(const std::string& id, const std::string& text) {
+    if (text.empty()) return;
+
+    Agent* agent = nullptr;
+    bool rejected = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = agents_.find(id);
+        if (it == agents_.end()) return;
+        if (it->second.busy) {
+            rejected = true;
+        } else {
+            it->second.busy = true;
+            agent = it->second.agent.get();
+        }
+    }
+
+    if (rejected) {
+        send_to(id, stream_packet({{"event", "warning"}, {"text", "still running a turn"}}));
+        send_to(id, turn_done_packet(1));
+        return;
+    }
+
+    std::thread([this, id, agent, text] {
+        WireSink sink([this, id](const nlohmann::json& frame) -> bool {
+            return send_to(id, frame);
+        });
+
+        int rc = 1;
+        try {
+            if (agent->has_provider()) {
+                rc = agent->run_turn(text, sink);
+            } else {
+                sink.warning("prompt not run: server has no OPENROUTER_API_KEY");
+            }
+        } catch (const std::exception& e) {
+            sink.warning(std::string("server error: ") + e.what());
+            rc = 1;
+        }
+
+        if (sink.alive()) {
+            TokenUsage u = agent->usage();
+            send_to(id, ctx_packet(u.prompt_tokens, agent->context_window()));
+            sink.done(rc);
+        }
+
+        bool idle = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = agents_.find(id);
+            if (it != agents_.end()) {
+                it->second.busy = false;
+                if (clients_.count(id) == 0) agents_.erase(it);
+            }
+            idle = solo_ && clients_.empty();
+        }
+        if (idle) {
+            closing_.store(true);
+            g_stop_signal = 1;
+        }
+    }).detach();
+}
+
+void SwarmsServer::deliver_inbox(const std::string& id, const std::string& type,
+                                 const nlohmann::json& msg) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto ait = agents_.find(id);
+    if (ait == agents_.end() || !ait->second.agent->swarm()) return;
+    static_cast<PeerView*>(ait->second.agent->swarm())->inject(type, msg);
+}
+
+void SwarmsServer::route_message(const std::string& from_id, const std::string& to,
+                                 const std::string& text) {
+    std::vector<std::string> targets;
+    std::string from_name;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto fit = clients_.find(from_id);
+        if (fit == clients_.end()) return;
+        from_name = fit->second.name;
+        if (to == "all") {
+            for (const auto& [pid, pc] : clients_) {
+                if (pid != from_id) targets.push_back(pid);
+            }
+        } else if (to == "repo") {
+            auto members = repo_members_.find(fit->second.repo);
+            if (members != repo_members_.end()) {
+                for (const auto& pid : members->second) {
+                    if (pid != from_id) targets.push_back(pid);
+                }
+            }
+        } else {
+            if (clients_.count(to) && to != from_id) targets.push_back(to);
+        }
+    }
+    nlohmann::json notice = msg_notice(from_name, text, now_iso());
+    for (const auto& tid : targets) {
+        deliver_inbox(tid, "msg", notice);
+    }
+}
+
+void SwarmsServer::maybe_shutdown_if_idle() {
+    bool idle = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        idle = solo_ && clients_.empty();
+        if (idle) {
+            for (const auto& [id, slot] : agents_) {
+                if (slot.busy) {
+                    idle = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (idle) {
+        closing_.store(true);
+        g_stop_signal = 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client connection.
+// ---------------------------------------------------------------------------
 
 void SwarmsServer::handle_client(int fd) {
     set_nosigpipe(fd);
@@ -188,13 +457,11 @@ void SwarmsServer::handle_client(int fd) {
     std::vector<nlohmann::json> peers;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        clients_[id] = Client{id, name, repo, fd};
-        repo_members_[repo].push_back(id);
-        for (auto& [pid, pc] : clients_) {
-            peers.push_back(agent_info(pid, pc.name, pc.repo));
-        }
+        hello_register(id, name, repo, fd, peers);
     }
+    create_agent_slot(id, repo);
     send_to(id, hello_ack(id, nlohmann::json(peers)));
+    send_state(id);
 
     for (;;) {
         if (reader.next_line(line) != ReadResult::Ok) break;
@@ -205,7 +472,13 @@ void SwarmsServer::handle_client(int fd) {
             break;
         }
         std::string t = type_of(msg);
-        if (t == "read") {
+        if (t == "prompt") {
+            schedule_prompt(id, msg.value("text", ""));
+        } else if (t == "clear") {
+            clear_agent_history(id);
+        } else if (t == "model_set") {
+            set_agent_model(id, msg.value("model", ""));
+        } else if (t == "read") {
             std::string path = msg.value("path", "");
             std::string hash = msg.value("hash", "");
             if (path.empty()) continue;
@@ -219,31 +492,7 @@ void SwarmsServer::handle_client(int fd) {
             if (path.empty()) continue;
             notify_file_changed(canonical_path(repo, path), hash, id, now_iso());
         } else if (t == "msg") {
-            std::string to = msg.value("to", "");
-            std::string text = msg.value("text", "");
-            if (to.empty() || text.empty()) continue;
-            std::vector<std::string> targets;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                if (to == "all") {
-                    for (auto& [pid, pc] : clients_) {
-                        if (pid != id) targets.push_back(pid);
-                    }
-                } else if (to == "repo") {
-                    auto members = repo_members_.find(repo);
-                    if (members != repo_members_.end()) {
-                        for (auto& pid : members->second) {
-                            if (pid != id) targets.push_back(pid);
-                        }
-                    }
-                } else {
-                    if (clients_.count(to) && to != id) targets.push_back(to);
-                }
-            }
-            std::string at = now_iso();
-            for (auto& tid : targets) {
-                send_to(tid, msg_notice(name, text, at));
-            }
+            route_message(id, msg.value("to", ""), msg.value("text", ""));
         } else if (t == "agents") {
             std::vector<nlohmann::json> agents;
             {
@@ -267,7 +516,12 @@ void SwarmsServer::handle_client(int fd) {
     }
     std::lock_guard<std::mutex> lk(send_mu_);
     ::close(fd);
+    maybe_shutdown_if_idle();
 }
+
+// ---------------------------------------------------------------------------
+// Poller + shutdown + main loop.
+// ---------------------------------------------------------------------------
 
 void SwarmsServer::poller_loop() {
     while (!closing_.load()) {
@@ -339,6 +593,7 @@ int SwarmsServer::run() {
     if (sfd < 0) return 1;
 
     g_stop_signal = 0;
+    closing_.store(false);
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
@@ -347,7 +602,7 @@ int SwarmsServer::run() {
 
     poller_ = std::thread([this] { poller_loop(); });
 
-    while (!g_stop_signal) {
+    while (!g_stop_signal && !closing_.load()) {
         struct pollfd pfd;
         pfd.fd = sfd;
         pfd.events = POLLIN;

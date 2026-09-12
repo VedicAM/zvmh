@@ -2,14 +2,14 @@
 #define TOOL_PEERS_H
 
 #include "tool.h"
-#include "../server/client.h"
+#include "../server/swarm_peer.h"
 #include <chrono>
 #include <thread>
 
 // List the other agents currently connected to the swarm server.
 class PeersTool : public Tool {
 public:
-    explicit PeersTool(swarm::ServerClient* client) : client_(client) {}
+    explicit PeersTool(swarm::SwarmPeer* peer) : peer_(peer) {}
 
     const char* name() const override { return "peers"; }
     const char* description() const override {
@@ -52,15 +52,15 @@ EXAMPLES
     }
 
     std::string execute(const nlohmann::json& input) override {
-        if (!client_ || !client_->connected()) {
+        if (!peer_ || !peer_->connected()) {
             return "Error: not connected to a swarm server (start one with `zvmh --server start`, connect with `--connect`)";
         }
         bool refresh = input.value("refresh", false);
         if (refresh) {
-            client_->request_peers();
+            peer_->request_peers();
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        std::vector<nlohmann::json> peers = client_->peers();
+        std::vector<nlohmann::json> peers = peer_->peers();
         if (peers.empty()) {
             return "No peers connected (you are alone on the server)";
         }
@@ -74,7 +74,7 @@ EXAMPLES
     }
 
 private:
-    swarm::ServerClient* client_;
+    swarm::SwarmPeer* peer_;
 };
 
 #endif

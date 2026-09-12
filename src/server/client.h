@@ -9,6 +9,7 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "protocol.h"
+#include "swarm_peer.h"
 
 namespace swarm {
 
@@ -17,10 +18,8 @@ namespace swarm {
 // actions the agent/tools need (register_read, report_write, send_message,
 // request_peers). Inbound traffic after hello_ack is forwarded to a caller-set
 // handler (called from the reader thread) and peer snapshots are kept current.
-class ServerClient {
+class ServerClient : public SwarmPeer {
 public:
-    using MessageHandler = std::function<void(const std::string& type, const nlohmann::json& msg)>;
-
     ServerClient(const std::string& host, int port) : host_(host), port_(port) {}
     ~ServerClient();
 
@@ -30,16 +29,21 @@ public:
     // TCP connect + hello exchange. Blocks until hello_ack (5s deadline).
     bool connect(const std::string& repo, const std::string& name);
 
-    void set_handler(MessageHandler h) {
+    // Agent-loop frames sent from a client that talks to a server-hosted runtime.
+    bool send_prompt(const std::string& text);
+    bool send_clear();
+    bool send_model(const std::string& model);
+
+    void set_handler(MessageHandler h) override {
         std::lock_guard<std::mutex> lk(mu_);
         handler_ = std::move(h);
     }
 
-    bool register_read(const std::string& path);
-    bool report_write(const std::string& path);
-    bool send_message(const std::string& to, const std::string& text);
-    bool request_peers();
-    bool knows_peer(const std::string& id) const {
+    bool register_read(const std::string& path) override;
+    bool report_write(const std::string& path) override;
+    bool send_message(const std::string& to, const std::string& text) override;
+    bool request_peers() override;
+    bool knows_peer(const std::string& id) const override {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto& p : peers_) {
             if (p.value("id", "") == id) return true;
@@ -48,11 +52,11 @@ public:
     }
 
     void disconnect();
-    bool connected() const { return running_.load(); }
-    std::string id() const { return id_; }
+    bool connected() const override { return running_.load(); }
+    std::string id() const override { return id_; }
     std::string repo() const { return repo_; }
     std::string name() const { return name_; }
-    std::vector<nlohmann::json> peers() const {
+    std::vector<nlohmann::json> peers() const override {
         std::lock_guard<std::mutex> lk(mu_);
         return peers_;
     }

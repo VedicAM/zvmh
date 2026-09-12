@@ -9,7 +9,10 @@
 //
 //   client -> server
 //     {"type":"hello","repo":...,"name":...}
-//     {"type":"read","path":...,"hash":...}
+//     {"type":"prompt","text":...}         run a turn for this agent (server-side LLM)
+//     {"type":"clear"}                     clear this agent's history
+//     {"type":"model_set","model":...}     switch this agent's model
+//     {"type":"read","path":...,"hash":...}   (legacy; served client-side tools no longer emit)
 //     {"type":"write","path":...,"hash":...}
 //     {"type":"msg","to":"all"|"repo"|"<agent-id>","text":...}
 //     {"type":"agents"}
@@ -18,6 +21,10 @@
 //
 //   server -> client
 //     {"type":"hello_ack","id":...,"peers":[...]}
+//     {"type":"state","provider":...,"model":...,"tools":[...],"ctx":...}
+//     {"type":"stream","event":...}        one per StreamSink callback
+//     {"type":"ctx","used":...,"total":...}
+//     {"type":"turn_done","rc":...}
 //     {"type":"conflict","path":...,"by":...,"at":...,"hash":...}
 //     {"type":"msg","from":...,"text":...,"at":...}
 //     {"type":"agents_list","agents":[...]}
@@ -47,6 +54,8 @@ namespace swarm {
 
 inline constexpr const char* kDefaultHost = "127.0.0.1";
 inline constexpr int kDefaultPort = 5500;
+inline constexpr const char* kSessionHost = "127.0.0.1";
+inline constexpr int kSessionPort = 5501;
 inline constexpr size_t kMaxFrameBytes = 4 * 1024 * 1024;
 inline constexpr size_t kReadChunkBytes = 64 * 1024;
 
@@ -109,6 +118,44 @@ inline nlohmann::json ping_msg() { return {{"type", "ping"}}; }
 inline nlohmann::json pong_msg() { return {{"type", "pong"}}; }
 inline nlohmann::json bye_msg() { return {{"type", "bye"}}; }
 inline nlohmann::json shutdown_msg() { return {{"type", "shutdown"}}; }
+
+// Agent-runtime round-trip frames. The server hosts the LLM + tool loop for
+// every connected client; these are the only frames sessions need.
+inline nlohmann::json prompt_req(const std::string& text) {
+    return {{"type", "prompt"}, {"text", text}};
+}
+
+inline nlohmann::json clear_req() {
+    return {{"type", "clear"}};
+}
+
+inline nlohmann::json model_req(const std::string& model) {
+    return {{"type", "model_set"}, {"model", model}};
+}
+
+inline nlohmann::json state_packet(const std::string& provider,
+                                   const std::string& model,
+                                   const nlohmann::json& tools,
+                                   int ctx_total) {
+    return {{"type", "state"}, {"provider", provider}, {"model", model},
+            {"tools", tools}, {"ctx", ctx_total}};
+}
+
+// A single StreamSink callback, serialized. `fields` holds the per-event
+// payload (text/name/args/is_error/model/prompt/completion).
+inline nlohmann::json stream_packet(const nlohmann::json& fields) {
+    nlohmann::json j = {{"type", "stream"}};
+    j.update(fields);
+    return j;
+}
+
+inline nlohmann::json ctx_packet(int used, int total) {
+    return {{"type", "ctx"}, {"used", used}, {"total", total}};
+}
+
+inline nlohmann::json turn_done_packet(int rc) {
+    return {{"type", "turn_done"}, {"rc", rc}};
+}
 
 inline std::string type_of(const nlohmann::json& obj) {
     auto it = obj.find("type");

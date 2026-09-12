@@ -2,12 +2,12 @@
 #define TOOL_MSG_H
 
 #include "tool.h"
-#include "../server/client.h"
+#include "../server/swarm_peer.h"
 
 // Send a message to a peer agent (or every agent) over the swarm server.
 class MsgTool : public Tool {
 public:
-    explicit MsgTool(swarm::ServerClient* client) : client_(client) {}
+    explicit MsgTool(swarm::SwarmPeer* peer) : peer_(peer) {}
 
     const char* name() const override { return "msg"; }
     const char* description() const override {
@@ -58,22 +58,22 @@ EXAMPLES
     }
 
     std::string execute(const nlohmann::json& input) override {
-        if (!client_ || !client_->connected()) {
+        if (!peer_ || !peer_->connected()) {
             return "Error: not connected to a swarm server (start one with `zvmh --server start`, connect with `--connect`)";
         }
         std::string to = input["to"].get<std::string>();
         std::string text = input["text"].get<std::string>();
-        if (to != "all" && to != "repo" && !client_->knows_peer(to)) {
+        if (to != "all" && to != "repo" && !peer_->knows_peer(to)) {
             return "Error: no peer with id '" + to + "' is connected; use peers to list agents";
         }
-        if (!client_->send_message(to, text)) {
+        if (!peer_->send_message(to, text)) {
             return "Error: failed to send message to swarm server";
         }
         return "Message sent to " + to;
     }
 
 private:
-    swarm::ServerClient* client_;
+    swarm::SwarmPeer* peer_;
 };
 
 #endif

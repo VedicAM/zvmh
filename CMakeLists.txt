@@ -39,8 +39,12 @@ add_executable(zvmh src/main.cpp
     src/server/protocol.h
     src/server/server.h
     src/server/server.cpp
+    src/server/swarm_peer.h
+    src/server/wire_sink.h
     src/server/client.h
     src/server/client.cpp
+    src/remote/remote_agent.h
+    src/remote/remote_agent.cpp
     src/system/systemcontext.h
     src/system/registry.h
     src/system/builtins.h)

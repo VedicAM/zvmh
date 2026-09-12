@@ -116,13 +116,15 @@ int Agent::run_once(const std::string& prompt) {
     return run_turn(prompt, sink);
 }
 
-void Agent::attach_swarm(std::unique_ptr<swarm::ServerClient> client) {
-    if (!client || !client->connected()) {
+void Agent::attach_swarm(std::unique_ptr<swarm::SwarmPeer> peer, bool with_tools) {
+    if (!peer || !peer->connected()) {
         return;
     }
-    swarm_ = std::move(client);
-    registry_.register_tool<MsgTool>(swarm_.get());
-    registry_.register_tool<PeersTool>(swarm_.get());
+    swarm_ = std::move(peer);
+    if (with_tools) {
+        registry_.register_tool<MsgTool>(swarm_.get());
+        registry_.register_tool<PeersTool>(swarm_.get());
+    }
     swarm_->set_handler([this](const std::string& type, const nlohmann::json& msg) {
         std::string line;
         if (type == "msg") {
@@ -146,6 +148,36 @@ void Agent::attach_swarm(std::unique_ptr<swarm::ServerClient> client) {
 void Agent::set_swarm_realtime(std::function<void(const std::string&)> realtime) {
     std::lock_guard<std::mutex> lk(swarm_inbox_mu_);
     swarm_realtime_ = std::move(realtime);
+}
+
+void Agent::notify_swarm_line(const std::string& line) {
+    std::lock_guard<std::mutex> lk(swarm_inbox_mu_);
+    if (swarm_realtime_) swarm_realtime_(line);
+}
+
+void Agent::rewrite_tool_paths(nlohmann::json& input) const {
+    if (tool_cwd_base_.empty()) return;
+
+    auto fix = [&](const char* key) {
+        auto it = input.find(key);
+        if (it != input.end() && it->is_string()) {
+            std::string v = it->get<std::string>();
+            if (!v.empty() && v[0] != '/') {
+                *it = tool_cwd_base_ + "/" + v;
+            }
+        }
+    };
+
+    fix("file_path");
+    fix("path");
+    fix("pattern");
+
+    auto it = input.find("workdir");
+    if (it == input.end() || it->is_null()) {
+        input["workdir"] = tool_cwd_base_;
+    } else {
+        fix("workdir");
+    }
 }
 
 std::string Agent::drain_swarm_text() {
@@ -258,20 +290,23 @@ int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
 
                 std::string result;
                 bool is_error = false;
+                nlohmann::json input;
                 try {
                     Tool* tool = registry_.get(tc.name);
                     if (!tool) {
                         result = "Error: Unknown tool: " + tc.name;
                         is_error = true;
                     } else {
-                        result = tool->execute(tc.input);
+                        input = tc.input;
+                        rewrite_tool_paths(input);
+                        result = tool->execute(input);
                     }
                 } catch (const std::exception& e) {
                     result = std::string("Error: ") + e.what();
                     is_error = true;
                 }
-                if (!is_error && swarm_ && swarm_->connected() && tc.input.contains("file_path")) {
-                    std::string fp = tc.input["file_path"].get<std::string>();
+                if (!is_error && swarm_ && swarm_->connected() && input.contains("file_path")) {
+                    std::string fp = input["file_path"].get<std::string>();
                     if (tc.name == "read") {
                         swarm_->register_read(fp);
                     } else if (tc.name == "write" || tc.name == "edit") {
