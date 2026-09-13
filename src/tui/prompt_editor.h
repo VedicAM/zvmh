@@ -44,6 +44,17 @@ int pe_string_width(const std::string& s) {
     return w;
 }
 
+// One '•' per UTF-8 glyph, for password-style masking of rendered content.
+std::string pe_mask(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        out += "\u2022";
+        i += pe_glyph_len(s, i);
+    }
+    return out;
+}
+
 // Byte index of the start of the glyph before `pos`.
 size_t pe_glyph_back(const std::string& s, size_t pos) {
     if (pos == 0) return 0;
@@ -66,12 +77,14 @@ public:
         int& cursor,
         std::function<void()> on_submit,
         std::function<void()> on_history_prev = {},
-        std::function<void()> on_history_next = {})
+        std::function<void()> on_history_next = {},
+        bool mask = false)
         : content_(content),
           cursor_(cursor),
           on_submit_(std::move(on_submit)),
           on_history_prev_(std::move(on_history_prev)),
-          on_history_next_(std::move(on_history_next)) {
+          on_history_next_(std::move(on_history_next)),
+          mask_(mask) {
         const auto size = Terminal::Size();
         if (size.dimx > 0) avail_ = size.dimx - 6;
     }
@@ -85,6 +98,7 @@ private:
     std::function<void()> on_submit_;
     std::function<void()> on_history_prev_;
     std::function<void()> on_history_next_;
+    bool mask_ = false;
     Box box_;
     int avail_ = 40;
 
@@ -328,6 +342,9 @@ private:
         cells.reserve(rows.size());
         for (size_t r = 0; r < rows.size(); ++r) {
             const std::string line = content_.substr(rows[r].start, rows[r].end - rows[r].start);
+            auto render_text = [&](const std::string& s) {
+                return text(mask_ ? prompt_editor_detail::pe_mask(s) : s);
+            };
             if (empty && r == 0) {
                 cells.push_back(hbox({
                     text("\u2588") | bold | color(Color::White),
@@ -336,12 +353,12 @@ private:
             } else if (static_cast<int>(r) == cursor_row) {
                 const size_t local = static_cast<size_t>(cursor_) - rows[r].start;
                 cells.push_back(hbox({
-                    text(line.substr(0, local)),
+                    render_text(line.substr(0, local)),
                     text("\u2588") | bold | color(Color::White),
-                    text(line.substr(local)),
+                    render_text(line.substr(local)),
                 }));
             } else {
-                cells.push_back(text(line));
+                cells.push_back(render_text(line));
             }
         }
         return vbox(std::move(cells)) | reflect(box_);

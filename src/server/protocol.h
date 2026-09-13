@@ -13,6 +13,8 @@
 //     {"type":"cancel"}                    abort this agent's running turn
 //     {"type":"clear"}                     clear this agent's history
 //     {"type":"model_set","model":...}     switch this agent's model
+//     {"type":"auth_set","provider":...,"api_key":...}
+//                                          re-authenticate this agent's provider
 //     {"type":"read","path":...,"hash":...}   (legacy; served client-side tools no longer emit)
 //     {"type":"write","path":...,"hash":...}
 //     {"type":"msg","to":"all"|"repo"|"<agent-id>","text":...}
@@ -136,6 +138,10 @@ inline nlohmann::json clear_req() {
 
 inline nlohmann::json model_req(const std::string& model) {
     return {{"type", "model_set"}, {"model", model}};
+}
+
+inline nlohmann::json auth_req(const std::string& provider, const std::string& api_key) {
+    return {{"type", "auth_set"}, {"provider", provider}, {"api_key", api_key}};
 }
 
 inline nlohmann::json state_packet(const std::string& provider,

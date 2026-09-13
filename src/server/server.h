@@ -107,6 +107,8 @@ private:
     void schedule_prompt(const std::string& id, const std::string& text);
     void clear_agent_history(const std::string& id);
     void set_agent_model(const std::string& id, const std::string& model);
+    void set_agent_credentials(const std::string& id, const std::string& provider,
+                               const std::string& api_key);
     void deliver_inbox(const std::string& id, const std::string& type,
                        const nlohmann::json& msg);
     void route_message(const std::string& from_id, const std::string& to,

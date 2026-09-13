@@ -15,6 +15,8 @@ add_subdirectory(vendor/json)
 add_subdirectory(vendor/ftxui)
 
 add_executable(zvmh src/main.cpp
+    src/auth.cpp
+    src/auth.h
     src/agent.cpp
     src/agent.h
     src/message/message.h
@@ -36,6 +38,7 @@ add_executable(zvmh src/main.cpp
     src/tool/write.h
     src/tool/msg.h
     src/tool/peers.h
+    src/tool/websearch.h
     src/server/protocol.h
     src/server/server.h
     src/server/server.cpp

@@ -26,6 +26,7 @@
 
 #include <nlohmann/json.hpp>
 #include "../agent.h"
+#include "../auth.h"
 
 using namespace ftxui;
 
@@ -376,6 +377,25 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     std::vector<std::string> completion_choices_;
     std::string completion_key_;
     size_t completion_index_ = 0;
+
+    // /connect dialog: step 0 picks a provider from the dropdown, step 1
+    // enters the api key. Credentials are stored to ~/.zvmh/auth.json and
+    // pushed to the hosted runtime over the wire.
+    bool connect_active_ = false;
+    int connect_step_ = 0;
+    int connect_provider_index_ = 0;
+    std::vector<std::string> connect_provider_names_;
+    std::string connect_api_key_;
+    int connect_key_cursor_ = 0;
+    std::string connect_saved_provider_;
+    bool connect_has_saved_key_ = false;
+
+    Component connect_modal_;
+    Component connect_provider_menu_;
+    Component connect_provider_step_;
+    Component connect_key_input_;
+    Component connect_key_step_;
+    Component connect_modal_inner_;
 
 
     bool follow_bottom_ = true;
@@ -748,6 +768,18 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                 });
             }
 
+        } else if (cmd == "/connect") {
+            if (busy_.load()) {
+                append(Line{
+                    "still running a turn...",
+                    Color::GrayLight,
+                    false,
+                    false
+                });
+            } else {
+                open_connect();
+            }
+
         } else if (
             cmd == "/tools" ||
             cmd.rfind("/tools ", 0) == 0) {
@@ -926,6 +958,12 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         } else if (cmd == "/help") {
             append_block({
                 Line{
+                    "/connect           pick a provider and store your api key",
+                    Color::Default,
+                    false,
+                    false
+                },
+                Line{
                     "/model             show current model",
                     Color::Default,
                     false,
@@ -1023,7 +1061,7 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     // All registered slash commands.
     static const std::vector<std::string>& command_choices() {
         static const std::vector<std::string> choices = {
-            "/model", "/tools", "/clear", "/agents", "/msg", "/help", "/exit", "/quit",
+            "/connect", "/model", "/tools", "/clear", "/agents", "/msg", "/help", "/exit", "/quit",
         };
         return choices;
     }
@@ -1031,6 +1069,7 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     // One-line description shown next to each command in the popup.
     static const char* command_desc(const std::string& name) {
         static const std::unordered_map<std::string, const char*> desc = {
+            {"/connect", "pick a provider and store your api key"},
             {"/model", "show or set the current model"},
             {"/tools", "list registered tools & schemas"},
             {"/clear", "clear conversation history"},
@@ -1158,6 +1197,224 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
             | clear_under
             | borderRounded
             | color(Color::GrayDark);
+    }
+
+    // ---- /connect dialog ----
+
+    // Build the modal once, in setup(); both steps live in a Tab keyed by
+    // connect_step_. Escape/Enter are handled by a CatchEvent per step so the
+    // menu and the api-key input never see them.
+    void build_connect_modal() {
+        const auto& providers = auth::supported_providers();
+
+        connect_provider_names_.reserve(providers.size());
+        for (const auto& p : providers)
+            connect_provider_names_.push_back(p.display_name);
+
+        connect_provider_menu_ =
+            Menu(&connect_provider_names_, &connect_provider_index_,
+                 MenuOption::Vertical());
+
+        connect_provider_step_ = CatchEvent(
+            Renderer(connect_provider_menu_, [this] {
+                return connect_provider_menu_->Render();
+            }),
+            [this](Event event) {
+                if (event == Event::Escape) {
+                    close_connect();
+                    return true;
+                }
+                if (event == Event::Return) {
+                    advance_to_key_step();
+                    return true;
+                }
+                return false;
+            });
+
+        // Same editor as the prompt bar (plain text + block cursor), with the
+        // same Escape/Enter handling; the mask flag hides the key on screen.
+        connect_key_input_ = Make<PromptEditor>(
+            connect_api_key_,
+            connect_key_cursor_,
+            [this] { save_connect(); },
+            std::function<void()>{},
+            std::function<void()>{},
+            true);
+
+        connect_key_step_ = CatchEvent(
+            Renderer(connect_key_input_, [this] {
+                return connect_key_input_->Render();
+            }),
+            [this](Event event) {
+                if (event == Event::Escape) {
+                    connect_step_ = 0;
+                    connect_provider_menu_->TakeFocus();
+                    screen.PostEvent(Event::Custom);
+                    return true;
+                }
+                return false;
+            });
+
+        connect_modal_inner_ =
+            Container::Tab({connect_provider_step_, connect_key_step_},
+                           &connect_step_);
+
+        connect_modal_ = Renderer(connect_modal_inner_, [this] {
+            return connect_modal_element();
+        });
+    }
+
+    const auth::ProviderInfo* selected_provider() const {
+        const auto& providers = auth::supported_providers();
+        if (connect_provider_index_ >= 0 &&
+            static_cast<size_t>(connect_provider_index_) < providers.size())
+            return &providers[static_cast<size_t>(connect_provider_index_)];
+        return providers.empty() ? nullptr : &providers.front();
+    }
+
+    void open_connect() {
+        std::string saved_key;
+        connect_saved_provider_.clear();
+        connect_has_saved_key_ = false;
+        auth::load_credentials(connect_saved_provider_, saved_key);
+        connect_has_saved_key_ = !saved_key.empty();
+        // Start blank so a paste/re-typing replaces wholesale rather than
+        // appending to a hidden prefilled key; the "saved:" line in the modal
+        // header still shows that a key is already stored.
+        connect_api_key_.clear();
+        connect_key_cursor_ = 0;
+
+        const auto& providers = auth::supported_providers();
+        connect_provider_index_ = 0;
+        for (size_t i = 0; i < providers.size(); ++i) {
+            if (providers[i].id == connect_saved_provider_) {
+                connect_provider_index_ = static_cast<int>(i);
+                break;
+            }
+        }
+
+        connect_step_ = 0;
+        connect_active_ = true;
+        connect_provider_menu_->TakeFocus();
+        screen.PostEvent(Event::Custom);
+    }
+
+    void advance_to_key_step() {
+        connect_step_ = 1;
+        connect_key_input_->TakeFocus();
+        screen.PostEvent(Event::Custom);
+    }
+
+    void close_connect() {
+        connect_active_ = false;
+        connect_step_ = 0;
+        input_component_->TakeFocus();
+        screen.PostEvent(Event::Custom);
+    }
+
+    void save_connect() {
+        const auth::ProviderInfo* p = selected_provider();
+        if (!p) {
+            close_connect();
+            return;
+        }
+
+        std::string key = trim_string(connect_api_key_);
+        if (key.empty()) {
+            append(Line{
+                "api key cannot be empty",
+                Color::RedLight,
+                false,
+                false
+            });
+            return;
+        }
+
+        if (!auth::save_credentials(p->id, key)) {
+            append(Line{
+                "failed to write " + auth::auth_file_path(),
+                Color::RedLight,
+                false,
+                false
+            });
+            return;
+        }
+
+        // Push the new credentials to the hosted runtime so they take effect
+        // without a restart; the server replies with a fresh `state` that
+        // updates the header.
+        agent.set_credentials(p->id, key);
+
+        connect_saved_provider_ = p->id;
+        connect_has_saved_key_ = true;
+
+        append_block({
+            Line{
+                "connected: " + p->display_name,
+                Color::Green,
+                true,
+                false
+            },
+            Line{
+                "saved api key to " + auth::auth_file_path(),
+                Color::GrayLight,
+                false,
+                false
+            },
+        });
+
+        close_connect();
+    }
+
+    Element connect_modal_element() {
+        const auth::ProviderInfo* p = selected_provider();
+        const std::string provider_name =
+            p ? p->display_name : "?";
+
+        const std::string title =
+            connect_step_ == 0
+                ? " connect · choose provider "
+                : " connect · " + provider_name + " api key ";
+
+        const std::string hint =
+            connect_step_ == 0
+                ? "  ↑/↓ select · enter next · esc cancel "
+                : "  paste your api key · enter save · esc back ";
+
+        Elements header;
+        header.push_back(
+            hbox({
+                text(" ") | dim,
+                text(title) | bold | color(Color::CyanLight),
+                filler(),
+            }));
+        if (connect_step_ == 0) {
+            header.push_back(
+                hbox({
+                    text(" ") | dim,
+                    text(connect_has_saved_key_
+                             ? "saved: " + connect_saved_provider_ + " (api key stored)"
+                             : "no saved credentials yet")
+                        | dim,
+                    filler(),
+                }));
+        }
+
+        return vbox({
+            vbox(std::move(header)),
+            separatorLight(),
+            connect_modal_inner_->Render(),
+            separatorLight(),
+            hbox({
+                text(" ") | dim,
+                text(hint) | dim,
+                filler(),
+            }),
+        })
+            | borderRounded
+            | size(WIDTH, GREATER_THAN, 48)
+            | size(WIDTH, LESS_THAN, 76)
+            | clear_under;
     }
 
     void run_turn_async(const std::string& prompt) {
@@ -1497,6 +1754,8 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     }
 
     void setup() {
+        build_connect_modal();
+
         input_component_ =
             Make<PromptEditor>(
                 input_,
@@ -1587,37 +1846,50 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
 
                     refresh_suggestions();
 
+                    Element base = body;
+
                     // When a slash command is being typed, float the
                     // autocomplete popup above the prompt bar, on top of
                     // everything else on screen.
-                    if (completion_choices_.empty())
-                        return body;
+                    if (!completion_choices_.empty()) {
+                        // Anchor the popup so its bottom edge sits above the
+                        // prompt bar (status row + separator + prompt height).
+                        int prompt_rows = prompt_box_.y_min >= 0
+                            ? prompt_box_.y_max - prompt_box_.y_min + 1
+                            : 1;
 
-                    // Anchor the popup so its bottom edge sits above the
-                    // prompt bar (status row + separator + prompt height).
-                    int prompt_rows = prompt_box_.y_min >= 0
-                        ? prompt_box_.y_max - prompt_box_.y_min + 1
-                        : 1;
+                        const int bottom_margin =
+                            prompt_rows + 1 + 1;
 
-                    const int bottom_margin =
-                        prompt_rows + 1 + 1;
+                        base = dbox({
+                            body,
 
-                    return dbox({
-                        body,
+                            vbox({
+                                filler(),
 
-                        vbox({
-                            filler(),
+                                suggestions_element()
+                                    | clear_under,
 
-                            suggestions_element()
-                                | clear_under,
+                                text("")
+                                    | size(
+                                        HEIGHT,
+                                        EQUAL,
+                                        bottom_margin),
+                            }),
+                        });
+                    }
 
-                            text("")
-                                | size(
-                                    HEIGHT,
-                                    EQUAL,
-                                    bottom_margin),
-                        }),
-                    });
+                    // The /connect dialog floats centered over everything.
+                    if (connect_active_) {
+                        base = dbox({
+                            base,
+                            connect_modal_->Render()
+                                | clear_under
+                                | center,
+                        });
+                    }
+
+                    return base;
                 });
 
         refresh_context();
@@ -1719,6 +1991,13 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         if (event == Event::Custom)
             return true;
 
+        // While the /connect dialog is open every key belongs to it: arrows
+        // move the provider menu, typed characters fill the api key input, Esc
+        // backs out step by step. The main layout only resumes once it is
+        // closed.
+        if (connect_active_)
+            return connect_modal_->OnEvent(event);
+
         // Esc-cancel: while a turn runs, the first Escape arms it, the second
         // aborts. When idle, Esc falls through to the layout (and clears any
         // stale armed state).
@@ -1806,6 +2085,26 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         return layout_->OnEvent(event);
     }
 
+    // When the session reports an empty provider (no key anywhere on the
+    // server), surface a one-line hint pointing at /connect instead of leaving
+    // the user confused when prompts get rejected. The provider arrives via the
+    // state frame right after connect, so poll briefly and give up early.
+    void startup_hint() {
+        std::thread([this] {
+            for (int i = 0; i < 25; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (!agent.provider_name().empty())
+                    return;
+            }
+            append(Line{
+                "no api key set — run /connect to pick a provider",
+                Color::YellowLight,
+                true,
+                false
+            });
+        }).detach();
+    }
+
     Element OnRender() override {
         return layout_->Render();
     }
@@ -1823,6 +2122,7 @@ Tui::~Tui(){
 
 int Tui::run() {
     std::cout << "\x1b[>1u" << std::flush;
+    impl_->startup_hint();
     impl_->screen.Loop(impl_);
     return 0;
 }

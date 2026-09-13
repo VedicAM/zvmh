@@ -46,6 +46,7 @@ public:
     std::string provider_name() const override;
     std::string model() const override;
     void set_model(const std::string& model) override;
+    bool set_credentials(const std::string& provider, const std::string& api_key) override;
     TokenUsage usage() const override;
     int context_window() override;
     std::vector<ToolDefinition> tools() const override;

@@ -97,6 +97,26 @@ public:
     virtual Tool* tool(const std::string& name) const { return registry_.get(name); }
     virtual void clear_messages() { messages_.clear(); }
 
+    // Swaps the backing provider, keeping history/tools/system context intact.
+    // Used by the server when a client re-authenticates (/connect). No-op on
+    // remote facades whose runtime lives server-side.
+    virtual void set_provider(std::unique_ptr<Provider> provider) {
+        // Keep the model the user set with /model across the swap.
+        std::string model = provider_ ? provider_->model() : "";
+        provider_ = std::move(provider);
+        if (provider_ && !model.empty()) provider_->set_model(model);
+    }
+
+    // Client-side credential handoff. The base does nothing; RemoteAgent pushes
+    // the new provider+key over the wire so the hosted runtime picks it up
+    // without a restart.
+    virtual bool set_credentials(const std::string& provider,
+                                 const std::string& api_key) {
+        (void)provider;
+        (void)api_key;
+        return false;
+    }
+
     bool has_provider() const { return provider_ != nullptr; }
     void set_tool_cwd_base(const std::string& base) { tool_cwd_base_ = base; }
 

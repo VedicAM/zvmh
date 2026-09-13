@@ -74,6 +74,13 @@ void RemoteAgent::set_model(const std::string& model) {
     if (connected_.load()) client_->send_model(model);
 }
 
+bool RemoteAgent::set_credentials(const std::string& provider, const std::string& api_key) {
+    if (!connected_.load()) return false;
+    // The server swaps the hosted provider and replies with a fresh `state`
+    // frame, which refreshes the cached provider/model in handle_frame().
+    return client_->send_auth(provider, api_key);
+}
+
 TokenUsage RemoteAgent::usage() const {
     std::lock_guard<std::mutex> lk(cache_mu_);
     return cached_usage_;

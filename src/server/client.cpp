@@ -187,6 +187,12 @@ bool ServerClient::send_model(const std::string& model) {
     return send_json(fd_, model_req(model));
 }
 
+bool ServerClient::send_auth(const std::string& provider, const std::string& api_key) {
+    if (provider.empty() || api_key.empty()) return false;
+    std::lock_guard<std::mutex> lk(send_mu_);
+    return send_json(fd_, auth_req(provider, api_key));
+}
+
 void ServerClient::disconnect() {
     int fd = fd_;
     if (running_.exchange(false)) {

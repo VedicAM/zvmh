@@ -9,6 +9,7 @@
 #include "glob.h"
 #include "grep.h"
 #include "ls.h"
+#include "websearch.h"
 
 inline void register_builtin_tools(Registry& registry) {
     registry.register_tool<BashTool>();
@@ -18,6 +19,7 @@ inline void register_builtin_tools(Registry& registry) {
     registry.register_tool<GlobTool>();
     registry.register_tool<GrepTool>();
     registry.register_tool<LsTool>();
+    registry.register_tool<WebSearchTool>();
 }
 
 #endif

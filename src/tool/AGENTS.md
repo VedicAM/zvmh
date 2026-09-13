@@ -9,7 +9,7 @@ Each tool is its own header, a `class XTool : public Tool` (`tool.h`), implement
 members:
 
 - `const char* name() const` — snake_case identifier used in the wire protocol (`bash`,
-  `edit`, `glob`, `grep`, `ls`, `read`, `write`). Never change an emitted name.
+  `edit`, `glob`, `grep`, `ls`, `read`, `websearch`, `write`). Never change an emitted name.
 - `const char* description() const` — see "Description format" below.
 - `nlohmann::json parameters_schema() const` — JSON Schema (draft-07 subset): top-level
   `{"type": "object", "properties": {...}, "required": [...]}`. Every parameter gets a

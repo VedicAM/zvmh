@@ -34,6 +34,7 @@ public:
     bool send_cancel();
     bool send_clear();
     bool send_model(const std::string& model);
+    bool send_auth(const std::string& provider, const std::string& api_key);
 
     void set_handler(MessageHandler h) override {
         std::lock_guard<std::mutex> lk(mu_);

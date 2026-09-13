@@ -41,6 +41,15 @@ std::string random_hex_id() {
     for (int i = 0; i < 4; ++i) s += hex[rng() & 15];
     return s;
 }
+
+// Maps a wire provider id to a fresh provider instance. Only ids registered in
+// src/auth.h supported_providers() construct something; unknown ids return
+// nullptr so the caller can report the problem instead of silently ignoring it.
+std::unique_ptr<OpenRouter> make_provider(const std::string& provider,
+                                          const std::string& api_key) {
+    if (provider != "openrouter" || api_key.empty()) return nullptr;
+    return std::make_unique<OpenRouter>(api_key);
+}
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -231,10 +240,12 @@ void SwarmsServer::hello_register(const std::string& id, const std::string& name
 }
 
 void SwarmsServer::create_agent_slot(const std::string& id, const std::string& repo) {
-    std::unique_ptr<OpenRouter> provider;
-    if (!api_key_.empty()) {
-        provider = std::make_unique<OpenRouter>(api_key_);
+    std::string api_key;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        api_key = api_key_;
     }
+    std::unique_ptr<OpenRouter> provider = make_provider("openrouter", api_key);
 
     AgentSlot slot;
     slot.agent = std::make_unique<Agent>(std::move(provider));
@@ -286,6 +297,31 @@ void SwarmsServer::set_agent_model(const std::string& id, const std::string& mod
     send_state(id);
 }
 
+void SwarmsServer::set_agent_credentials(const std::string& id, const std::string& provider,
+                                         const std::string& api_key) {
+    bool unsupported = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (agents_.find(id) == agents_.end()) return;
+
+        auto fresh = make_provider(provider, api_key);
+        if (!fresh) {
+            unsupported = true;
+        } else {
+            // Swap the backing provider (history/tools survive) and remember the
+            // key so agent slots created later use it too.
+            agents_[id].agent->set_provider(std::move(fresh));
+            api_key_ = api_key;
+        }
+    }
+    if (unsupported) {
+        send_to(id, stream_packet({{"event", "warning"},
+                                   {"text", "unsupported provider '" + provider + "'"}}));
+        return;
+    }
+    send_state(id);
+}
+
 void SwarmsServer::schedule_prompt(const std::string& id, const std::string& text) {
     if (text.empty()) return;
 
@@ -319,7 +355,7 @@ void SwarmsServer::schedule_prompt(const std::string& id, const std::string& tex
             if (agent->has_provider()) {
                 rc = agent->run_turn(text, sink);
             } else {
-                sink.warning("prompt not run: server has no OPENROUTER_API_KEY");
+                sink.warning("prompt not run: no provider api key set — run /connect to store one");
             }
         } catch (const std::exception& e) {
             sink.warning(std::string("server error: ") + e.what());
@@ -487,6 +523,9 @@ void SwarmsServer::handle_client(int fd) {
             clear_agent_history(id);
         } else if (t == "model_set") {
             set_agent_model(id, msg.value("model", ""));
+        } else if (t == "auth_set") {
+            set_agent_credentials(id, msg.value("provider", ""),
+                                  msg.value("api_key", ""));
         } else if (t == "read") {
             std::string path = msg.value("path", "");
             std::string hash = msg.value("hash", "");

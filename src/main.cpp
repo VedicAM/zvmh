@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
+#include "auth.h"
 #include "remote/remote_agent.h"
 #include "server/server.h"
 #include "system/builtins.h"
@@ -109,8 +110,10 @@ bool port_alive(const string& host, int port) {
 int run_server(const Args& a, const filesystem::path& pidfile,
                const filesystem::path& logfile) {
     int port = a.session ? swarm::kSessionPort : a.port;
-    const char* key = getenv("OPENROUTER_API_KEY");
-    swarm::SwarmsServer server(a.addr, port, a.poll_ms, key ? key : "", a.session);
+    // Env var wins; otherwise fall back to the key stored by the TUI's
+    // /connect command (~/.zvmh/auth.json).
+    std::string key = auth::active_api_key();
+    swarm::SwarmsServer server(a.addr, port, a.poll_ms, key, a.session);
 
     if (a.daemon) {
         if (filesystem::exists(pidfile)) {
@@ -221,23 +224,17 @@ int cmd_server(const Args& a) {
 }
 
 // Boot a per-session backend on kSessionPort if nothing answers there yet.
-// The daemon inherits our cwd and OPENROUTER_API_KEY, self-terminates when its
-// last client disconnects, and keeps a pidfile for explicit `--server stop
-// --session`. Requires an API key (a swarm-only daemon is only useful when the
-// user opts into a shared server explicitly).
+// The daemon inherits our cwd and the effective API key (env var winning over
+// ~/.zvmh/auth.json), self-terminates when its last client disconnects, and
+// keeps a pidfile for explicit `--server stop --session`. Runs fine without a
+// key: the TUI opens and prompts the user to run /connect; prompts are
+// rejected with a warning until a provider is configured.
 int ensure_session_backend(const Args& a) {
     if (port_alive(swarm::kSessionHost, swarm::kSessionPort)) {
         return 0;
     }
 
-    const char* key = getenv("OPENROUTER_API_KEY");
-    if (!key || !*key) {
-        cerr << "Error: OPENROUTER_API_KEY is not set; no session backend to run prompts.\n"
-             << "  Start a shared server instead and connect to it with\n"
-             << "    zvmh --connect " << swarm::kDefaultHost << ":" << swarm::kDefaultPort << "\n"
-             << "  or export OPENROUTER_API_KEY to auto-spawn a session daemon.\n";
-        return 1;
-    }
+    std::string key = auth::active_api_key();
 
     filesystem::path pidfile = session_pidfile();
     filesystem::create_directories(pidfile.parent_path());

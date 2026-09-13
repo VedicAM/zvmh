@@ -6,13 +6,15 @@ C++17 CLI coding agent (zvmh) whose mission is to get the best possible performa
 
 ```sh
 cmake -S . -B build && cmake --build build      # deps are git submodules (vendor/json, vendor/cpr) + vendor/ftxui
-export OPENROUTER_API_KEY=<key>                 # required for the auto-spawned session daemon
+export OPENROUTER_API_KEY=<key>                 # optional: env wins, else ~/.zvmh/auth.json is used
 ./build/zvmh -m "<prompt>" -C <dir>             # one-shot CLI (streams to stdout)
 ./build/zvmh                                    # no -m -> FTXUI fullscreen TUI
 ./build/zvmh --connect 127.0.0.1:5500 -m "..."  # join a shared swarms server instead
 ./build/zvmh --server start|stop|status         # manage the shared daemon on 5500
 ./build/zvmh --server start|stop|status --session   # manage the session daemon on 5501
 ```
+
+- Credentials resolve in `auth::active_api_key()` (`src/auth.h`): `OPENROUTER_API_KEY` env var wins, otherwise `~/.zvmh/auth.json` (written by the TUI's `/connect`, `{"provider": "...", "api_key": "..."}`). `/connect` is the dropdown for `auth::supported_providers()` at `src/auth.cpp`; **to add a provider, implement it in `src/provider/`, add one entry to that registry, and map its id in `swarm::make_provider` (`src/server/server.cpp`)**.
 
 - Every `src/**` file must be listed explicitly in `CMakeLists.txt` (no `file(GLOB)`). Adding a `.cpp`/`.h` without updating it breaks the build.
 - OpenRouter is the only provider. All authentication goes through the `OPENROUTER_API_KEY` env var — no credential files.
@@ -36,7 +38,7 @@ export OPENROUTER_API_KEY=<key>                 # required for the auto-spawned 
 - **Ordering is mandatory:** push the assistant message (with all `tool_calls`), then insert results for EVERY call, and only then call `complete()` again. Never make a second model request before responses are in history. Parallel tool calls require one response per id.
 - **Parallel call indexing:** `ToolUseStartEvent`/`ToolInputDeltaEvent` carry an `index`. OpenRouter forwards the API delta's `index` (`tc.value("index", 0)` in `openrouter.cpp:166`). The agent maps streaming index → `tool_calls` slot, so don't drop it.
 - The agent's tool executor (`src/agent.cpp` `run_turn`) snapshots `history_start`, wraps each `tool->execute` in try/catch so a failed tool still yields a `ToolResultBlock` ("Error: ..."), and on unexpected exception rolls history back to `history_start`. Unknown tool names produce an `Error: Unknown tool` result, not a crash. Max 10 tool steps per turn.
-- `src/tool/`: header-only `Tool` ABC + `Registry`. Register every tool in `src/tool/registry.h` `register_builtin_tools`; currently bash, edit, glob, grep, ls, read, write.
+- `src/tool/`: header-only `Tool` ABC + `Registry`. Register every tool in `src/tool/registry.h` `register_builtin_tools`; currently bash, edit, glob, grep, ls, read, websearch, write.
 - `StreamSink` (`src/agent.h`) is the output abstraction for turns: `run_turn(prompt, sink)` is the single shared tool-loop. The one-shot CLI uses a `StdoutSink` (`src/agent.cpp`); the TUI uses a sink that appends styled lines; the server uses `WireSink` (`src/server/wire_sink.h`) that turns every sink callback into a `stream` wire frame. Never bypass the sink for turn output.
 - **Server-hosted tool paths:** each hosted agent gets `set_tool_cwd_base(repo)` (from the client's hello `repo`). `Agent::rewrite_tool_paths` rewrites relative `file_path`/`path`/`pattern`/`workdir` inputs against that base before `tool->execute`, because threads cannot `chdir` per agent. `bash` defaults its `workdir` to the repo. Process cwd (and the system-context task, which reads cwd) remains the daemon's own.
 - `src/server/swarm_peer.h`: `SwarmPeer` is the interface the agent's tool loop and realtime path rely on. Two impls: `ServerClient` (real TCP, also the thin client's transport) and `SwarmsServer::PeerView` (fully in-process, `inject()` simulates frames so `msg`/`conflict` land in the hosted agent's `swarm_inbox_`). Both implement `register_read`/`report_write`/`send_message`/`request_peers`/`peers`/`knows_peer`.
