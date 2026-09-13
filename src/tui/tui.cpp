@@ -146,6 +146,7 @@ std::vector<Line> wrap_line(const Line& line, int limit) {
 
     std::vector<Line> rows;
     Line row;
+    row.gutter = line.gutter;
     int width = 0;
 
     auto append_glyph = [&](const std::string& glyph, const Span& style) {
@@ -171,6 +172,7 @@ std::vector<Line> wrap_line(const Line& line, int limit) {
         if (!row.spans.empty()) {
             rows.push_back(std::move(row));
             row = Line{};
+            row.gutter = line.gutter;
             width = 0;
         }
     };
@@ -278,7 +280,15 @@ Element physical_line_element(const Line& line) {
         return text("");
 
     Elements cells;
-    cells.reserve(line.spans.size());
+
+    // User-prompt gutter: a blue bar runs down the left of every row the
+    // message occupies, so multi-line prompts read as one tall quote.
+    if (line.gutter) {
+        cells.push_back(text("▌") | color(Color::Blue));
+        cells.push_back(text(" "));
+    }
+
+    cells.reserve(cells.size() + line.spans.size());
 
     for (const auto& span : line.spans)
         cells.push_back(span_element(span));
@@ -419,7 +429,13 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
             width = 100;
 
         for (const auto& line : lines_) {
-            auto wrapped = wrap_line(line, width);
+            // Gutter rows gain a '│ ' prefix, so give them two fewer wrap
+            // columns to keep the transcript within the vieport.
+            int wrap = width;
+            if (line.gutter)
+                wrap = std::max(1, wrap - 2);
+
+            auto wrapped = wrap_line(line, wrap);
 
             for (auto& row : wrapped)
                 physical_lines_.push_back(std::move(row));
@@ -1246,8 +1262,6 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
         if (prompt.empty())
             return;
 
-        record_history(prompt);
-
         input_.clear();
         input_cursor_ = 0;
 
@@ -1256,12 +1270,9 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
             return;
         }
 
-        append(Line{
-            "> " + prompt,
-            Color::BlueLight,
-            true,
-            false
-        });
+        record_history(prompt);
+
+        append(Line{prompt, ftxui::Color::Default, false, false, true});
 
         run_turn_async(prompt);
     }
@@ -1383,14 +1394,18 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
 
     Element loading_element() {
         // Indeterminate loader:
-        // a soft shade gradient slides across the bar.
+        // a compact shade-gradient head bounces edge-to-edge so no long
+        // empty tail ever scrolls off-screen.
 
-        const int cells = 14;
+        const int cells = 8;
 
-        const int pos =
-            static_cast<int>(anim_phase_.load()) %
-                (cells + 4) -
-            2;
+        const int frame =
+            static_cast<int>(anim_phase_.load());
+
+        // Ping-pong position in [0, cells-1].
+        const int period = 2 * (cells - 1);
+        const int t = frame % period;
+        const int pos = t < cells ? t : period - t;
 
         std::string bar;
 
@@ -1407,7 +1422,7 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
                          "\u2591";
         }
 
-        bar += "  typing";
+        bar += " typing";
 
         return hbox({
             text(" ") | dim,

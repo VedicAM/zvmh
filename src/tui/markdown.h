@@ -26,10 +26,19 @@ struct Span {
 struct Line {
     std::vector<Span> spans;
 
+    // When set, the row renders with a blue gutter bar on the left. Used by
+    // the TUI to mark user prompts; blank rows carry it forward so the wraps
+    // of one message read as a single tall quote.
+    bool gutter = false;
+
     Line() = default;
     explicit Line(std::string t) { spans.emplace_back(Span{std::move(t)}); }
     Line(std::string t, ftxui::Color color, bool bold, bool dim) {
         spans.emplace_back(Span{std::move(t), color, bold, dim, false});
+    }
+    Line(std::string t, ftxui::Color color, bool bold, bool dim, bool g) {
+        spans.emplace_back(Span{std::move(t), color, bold, dim, false});
+        gutter = g;
     }
     explicit Line(std::vector<Span> s) : spans(std::move(s)) {}
 };
