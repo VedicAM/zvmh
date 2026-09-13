@@ -336,6 +336,9 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     std::atomic<int> ctx_window_{0};
     std::atomic<uint32_t> anim_phase_{0};
 
+    // First Esc during a turn arms cancel; a second quick Esc aborts it.
+    bool esc_armed_ = false;
+
     std::mutex mutex_;
 
     // Logical markdown lines.
@@ -1158,6 +1161,7 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
             flush_live_text();
 
             busy_.store(false);
+            esc_armed_ = false;
 
             screen.PostEvent(Event::Custom);
         }).detach();
@@ -1699,6 +1703,34 @@ struct Tui::Impl : public ComponentBase, public StreamSink {
     bool OnEvent(Event event) override {
         if (event == Event::Custom)
             return true;
+
+        // Esc-cancel: while a turn runs, the first Escape arms it, the second
+        // aborts. When idle, Esc falls through to the layout (and clears any
+        // stale armed state).
+        if (event == Event::Escape) {
+            if (busy_.load()) {
+                if (esc_armed_) {
+                    esc_armed_ = false;
+                    agent.cancel_turn();
+                    append(Line{
+                        "› cancelling turn...",
+                        Color::GrayLight,
+                        false,
+                        false
+                    });
+                    return true;
+                }
+                esc_armed_ = true;
+                append(Line{
+                    "› press Esc again to cancel",
+                    Color::GrayLight,
+                    false,
+                    false
+                });
+                return true;
+            }
+            esc_armed_ = false;
+        }
 
         if (event == Event::PageUp ||
             event == Event::PageDown) {

@@ -39,6 +39,7 @@ public:
     // ---- Agent overrides (all server-backed) ----
 
     int run_turn(const std::string& prompt, StreamSink& sink) override;
+    void cancel_turn() override;
     void attach_swarm(std::unique_ptr<swarm::SwarmPeer> peer, bool with_tools) override;
     void set_swarm_realtime(std::function<void(const std::string&)> realtime) override;
 
@@ -102,6 +103,7 @@ private:
     std::mutex turn_mu_;
     std::condition_variable turn_cv_;
     bool turn_active_ = false;
+    bool cancel_pending_ = false;
     int turn_rc_ = 1;
     StreamSink* active_sink_ = nullptr;
 };

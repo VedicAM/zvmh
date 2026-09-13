@@ -2,6 +2,7 @@
 #define PROVIDER_H
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -36,10 +37,22 @@ protected:
     std::mutex context_mutex_;
     std::unordered_map<std::string, int> context_cache_;
 
+    // Cancellation handshake. complete() implementations wire this into the
+    // HTTP transport (cpr's SetCancellationParam) so an in-flight request is
+    // aborted promptly when a running turn is cancelled.
+    std::shared_ptr<std::atomic_bool> cancellation_state_ =
+        std::make_shared<std::atomic_bool>(false);
+
 public:
     explicit Provider(const std::string& api_key, std::string model = "unknown")
         : api_key_(api_key), model_(std::move(model)) {}
     virtual ~Provider() = default;
+
+    // Request cancellation of the in-flight complete() call. Thread-safe;
+    // callable from any thread (e.g. the server reader thread cancelling a
+    // client's running turn).
+    void request_cancel() { cancellation_state_->store(true); }
+    void clear_cancel() { cancellation_state_->store(false); }
 
     virtual ChatResponse chat(const std::string& prompt) = 0;
     virtual void complete(

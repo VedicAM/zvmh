@@ -474,6 +474,15 @@ void SwarmsServer::handle_client(int fd) {
         std::string t = type_of(msg);
         if (t == "prompt") {
             schedule_prompt(id, msg.value("text", ""));
+        } else if (t == "cancel") {
+            // Abort the running turn for this agent. The base Agent::cancel_turn
+            // flips the atomic and aborts the provider's in-flight request, so
+            // the turn thread returns (and sends turn_done) shortly after.
+            std::lock_guard<std::mutex> lk(mu_);
+            auto ait = agents_.find(id);
+            if (ait != agents_.end() && ait->second.busy) {
+                ait->second.agent->cancel_turn();
+            }
         } else if (t == "clear") {
             clear_agent_history(id);
         } else if (t == "model_set") {

@@ -124,6 +124,18 @@ void RemoteAgent::set_swarm_realtime(std::function<void(const std::string&)> rea
     realtime_ = std::move(realtime);
 }
 
+void RemoteAgent::cancel_turn() {
+    bool send = false;
+    {
+        std::lock_guard<std::mutex> lk(turn_mu_);
+        if (turn_active_) {
+            cancel_pending_ = true;
+            send = connected_.load();
+        }
+    }
+    if (send) client_->send_cancel();
+}
+
 int RemoteAgent::run_turn(const std::string& prompt, StreamSink& sink) {
     if (!connected_.load()) {
         sink.warning("not connected to a swarm server");
@@ -133,6 +145,7 @@ int RemoteAgent::run_turn(const std::string& prompt, StreamSink& sink) {
     {
         std::lock_guard<std::mutex> lk(turn_mu_);
         turn_active_ = true;
+        cancel_pending_ = false;
         turn_rc_ = 1;
         active_sink_ = &sink;
     }
@@ -256,6 +269,10 @@ void RemoteAgent::handle_frame(const std::string& type, const nlohmann::json& ms
     if (type == "stream") {
         std::lock_guard<std::mutex> lk(turn_mu_);
         if (!active_sink_ || !turn_active_) return;
+        // After a cancel, the server may still flush in-flight chunks before
+        // the abort lands; the user asked to stop, so drop the rest of this
+        // turn's output.
+        if (cancel_pending_) return;
         handle_stream_event(msg, *active_sink_);
         return;
     }
@@ -263,6 +280,7 @@ void RemoteAgent::handle_frame(const std::string& type, const nlohmann::json& ms
     if (type == "turn_done") {
         std::lock_guard<std::mutex> lk(turn_mu_);
         turn_rc_ = msg.value("rc", 1);
+        cancel_pending_ = false;
         turn_active_ = false;
         turn_cv_.notify_all();
     }

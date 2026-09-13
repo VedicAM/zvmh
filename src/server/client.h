@@ -31,6 +31,7 @@ public:
 
     // Agent-loop frames sent from a client that talks to a server-hosted runtime.
     bool send_prompt(const std::string& text);
+    bool send_cancel();
     bool send_clear();
     bool send_model(const std::string& model);
 

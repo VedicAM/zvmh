@@ -210,6 +210,7 @@ void OpenRouter::complete(
 
     cpr::Session session;
     session.SetUrl(cpr::Url{api_url()});
+    session.SetCancellationParam(cancellation_state_);
     session.SetHeader(cpr::Header{
         {"Authorization", "Bearer " + api_key_},
         {"Content-Type", "application/json"},

@@ -176,6 +176,11 @@ bool ServerClient::send_clear() {
     return send_json(fd_, clear_req());
 }
 
+bool ServerClient::send_cancel() {
+    std::lock_guard<std::mutex> lk(send_mu_);
+    return send_json(fd_, cancel_req());
+}
+
 bool ServerClient::send_model(const std::string& model) {
     if (model.empty()) return false;
     std::lock_guard<std::mutex> lk(send_mu_);

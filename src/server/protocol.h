@@ -10,6 +10,7 @@
 //   client -> server
 //     {"type":"hello","repo":...,"name":...}
 //     {"type":"prompt","text":...}         run a turn for this agent (server-side LLM)
+//     {"type":"cancel"}                    abort this agent's running turn
 //     {"type":"clear"}                     clear this agent's history
 //     {"type":"model_set","model":...}     switch this agent's model
 //     {"type":"read","path":...,"hash":...}   (legacy; served client-side tools no longer emit)
@@ -123,6 +124,10 @@ inline nlohmann::json shutdown_msg() { return {{"type", "shutdown"}}; }
 // every connected client; these are the only frames sessions need.
 inline nlohmann::json prompt_req(const std::string& text) {
     return {{"type", "prompt"}, {"text", text}};
+}
+
+inline nlohmann::json cancel_req() {
+    return {{"type", "cancel"}};
 }
 
 inline nlohmann::json clear_req() {

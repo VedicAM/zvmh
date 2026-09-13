@@ -319,6 +319,11 @@ private:
 int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
     size_t history_start = messages_.size();
 
+    // A fresh turn starts uncancelled; the previous turn's Cancelled condition
+    // must not leak into this one.
+    cancel_requested_.store(false);
+    if (provider_) provider_->clear_cancel();
+
     std::string effective_prompt = prompt;
     std::string swarm_block = drain_swarm_text();
     if (!swarm_block.empty()) {
@@ -346,6 +351,11 @@ int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
 
             TurnBridge bridge(sink, response_text, tool_calls, tool_index);
             provider_->complete(messages_, registry_.definitions(), system_prompt, bridge);
+
+            if (cancel_requested_) {
+                // Aborted mid-stream: stop now; nothing from this step is kept.
+                break;
+            }
 
             Message assistant_msg;
             assistant_msg.role = Role::Assistant;
@@ -375,6 +385,7 @@ int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
             }
 
             for (const auto& tc : tool_calls) {
+                if (cancel_requested_) break;
                 sink.tool_call(tc.name, tc.input);
 
                 std::string result;
@@ -411,14 +422,25 @@ int Agent::run_turn(const std::string& prompt, StreamSink& sink) {
             }
         }
 
+        if (cancel_requested_) {
+            // Roll the partial history back so a cancelled turn leaves no
+            // orphaned assistant tool-calls without matching results.
+            if (messages_.size() > history_start) {
+                messages_.resize(history_start);
+            }
+            return kCancelled;
+        }
+
         sink.warning("Reached maximum tool steps (" + std::to_string(max_steps) + ")");
         return 1;
     } catch (const std::exception& e) {
-        sink.warning(std::string("Error: ") + e.what());
+        if (!cancel_requested_) {
+            sink.warning(std::string("Error: ") + e.what());
+        }
         if (messages_.size() > history_start) {
             messages_.resize(history_start);
         }
-        return 1;
+        return cancel_requested_ ? kCancelled : 1;
     }
 }
 

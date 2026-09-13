@@ -1,6 +1,7 @@
 #ifndef AGENT_H
 #define AGENT_H
 
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -54,9 +55,18 @@ private:
     std::mutex swarm_inbox_mu_;
     std::function<void(const std::string&)> swarm_realtime_;
 
+    // Abort signal for the running turn: set by cancel_turn() from any thread,
+    // consulted by the tool loop at every step boundary and by the provider
+    // (via Provider::*_cancel) mid-request.
+    std::atomic<bool> cancel_requested_{false};
+
     std::string drain_swarm_text();
 
 public:
+    // run_turn() result code for a cancelled turn (nothing was executed and
+    // the partial history was rolled back).
+    static constexpr int kCancelled = 2;
+
     virtual ~Agent() = default;
     explicit Agent(std::unique_ptr<Provider> provider = nullptr);
 
@@ -89,6 +99,14 @@ public:
 
     bool has_provider() const { return provider_ != nullptr; }
     void set_tool_cwd_base(const std::string& base) { tool_cwd_base_ = base; }
+
+    // Abort the running turn (thread-safe). The base implementation signals the
+    // in-process runtime and aborts the provider's in-flight request.
+    virtual void cancel_turn() {
+        cancel_requested_.store(true);
+        if (provider_) provider_->request_cancel();
+    }
+    bool cancel_requested() const { return cancel_requested_.load(); }
 
     void add_message(const Message& message);
     void set_system_prompt(const std::string& prompt);
