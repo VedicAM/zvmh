@@ -65,6 +65,46 @@ size_t pe_glyph_back(const std::string& s, size_t pos) {
     return prev;
 }
 
+// Recognizes the key sequence that means "select all". With kiu
+// (modifyOtherKeys) enabled the terminal reports modified keys as raw
+// CSI-u / xterm sequences instead of a classic control byte. Modifier
+// bitmask: shift=1, alt=2, ctrl=4, super/cmd=8; terminals that cannot
+// disambiguate sometimes pack a plain Ctrl as 5.
+#if defined(__APPLE__)
+// macOS: Command+A selects all. Terminals like iTerm2/kitty forward Cmd as
+// the Super modifier (8) in CSI-u. Alacritty on macOS intercepts Cmd itself
+// and never sends it, so we also accept Ctrl+A as a fallback — the only
+// way select-all can actually fire in Alacritty.
+bool pe_is_select_all(const std::string& input) {
+    if (input == "\x1b[97;8u" ||      // CSI-u: Super+A (Cmd)
+        input == "\x1b[97;9u" ||      // CSI-u: Shift+Super+A
+        input == "\x1b[1;8u" ||       // CSI-u numeric: Super+A
+        input == "\x1b[1;9u" ||
+        input == "\x1b[27;8;97~" ||   // xterm modifyOtherKeys: Meta+A
+        input == "\x1b[27;9;97~")
+        return true;
+    // Ctrl+A kiu forms — fallback for Alacritty where Cmd never arrives.
+    if (input == "\x1b[97;4u" ||      // CSI-u: Ctrl+A
+        input == "\x1b[97;5u" ||      // CSI-u: Ctrl+A (terminals pack Ctrl as 5)
+        input == "\x1b[1;4u" ||
+        input == "\x1b[1;5u" ||
+        input == "\x1b[27;4;97~" ||
+        input == "\x1b[27;5;97~")
+        return true;
+    return false;
+}
+#else
+// Linux/Windows: Ctrl+A selects all.
+bool pe_is_select_all(const std::string& input) {
+    return input == "\x1b[97;4u" ||      // CSI-u: Ctrl+A
+           input == "\x1b[97;5u" ||      // CSI-u: Shift+Ctrl+A (Ctrl packed as 5)
+           input == "\x1b[1;4u" ||       // CSI-u numeric form: Ctrl+A
+           input == "\x1b[1;5u" ||
+           input == "\x1b[27;4;97~" ||   // xterm modifyOtherKeys: Ctrl+A
+           input == "\x1b[27;5;97~";
+}
+#endif
+
 }  // namespace prompt_editor_detail
 
 // A small multiline text editor backed by a plain std::string, rendered as
@@ -99,6 +139,7 @@ private:
     std::function<void()> on_history_prev_;
     std::function<void()> on_history_next_;
     bool mask_ = false;
+    int sel_anchor_ = -1;  // byte offset of the selection anchor; -1 = none
     Box box_;
     int avail_ = 40;
 
@@ -172,7 +213,25 @@ private:
         if (cursor_ > static_cast<int>(content_.size())) cursor_ = static_cast<int>(content_.size());
     }
 
+    bool sel_active() const {
+        return sel_anchor_ >= 0 && sel_anchor_ != cursor_;
+    }
+
+    void clear_selection() { sel_anchor_ = -1; }
+
+    // Erase the selected span and collapse the selection onto the cursor.
+    bool erase_selection() {
+        if (!sel_active()) return false;
+        const size_t lo = static_cast<size_t>(std::min(sel_anchor_, cursor_));
+        const size_t hi = static_cast<size_t>(std::max(sel_anchor_, cursor_));
+        content_.erase(lo, hi - lo);
+        cursor_ = static_cast<int>(lo);
+        sel_anchor_ = -1;
+        return true;
+    }
+
     bool handle_backspace() {
+        if (erase_selection()) return true;
         if (cursor_ <= 0) return true;
         const size_t prev = prompt_editor_detail::pe_glyph_back(content_, static_cast<size_t>(cursor_));
         content_.erase(prev, static_cast<size_t>(cursor_) - prev);
@@ -181,6 +240,7 @@ private:
     }
 
     bool handle_delete() {
+        if (erase_selection()) return true;
         if (cursor_ >= static_cast<int>(content_.size())) return false;
         const size_t glen = prompt_editor_detail::pe_glyph_len(content_, static_cast<size_t>(cursor_));
         content_.erase(static_cast<size_t>(cursor_), glen);
@@ -188,6 +248,7 @@ private:
     }
 
     bool handle_arrow_horizontal(int delta) {
+        clear_selection();
         clamp_cursor();
         if (delta < 0) {
             if (cursor_ > 0) {
@@ -202,6 +263,7 @@ private:
     }
 
     bool handle_vertical(int dir) {
+        clear_selection();
         clamp_cursor();
         const std::vector<Row> rows = wrap();
         int row = 0;
@@ -238,6 +300,7 @@ private:
     }
 
     void handle_home_end(bool home) {
+        clear_selection();
         const std::vector<Row> rows = wrap();
         const int row = cursor_row(rows);
         cursor_ = home ? static_cast<int>(rows[static_cast<size_t>(row)].start)
@@ -253,6 +316,7 @@ private:
             return false;
         }
         TakeFocus();
+        clear_selection();
         const std::vector<Row> rows = wrap();
         const int target_row = m.y - box_.y_min;
         if (target_row < 0) return true;
@@ -282,8 +346,18 @@ private:
             return true;
         }
 
+        // Select all: Cmd+A on macOS (Ctrl+A also works, since terminals like
+        // Alacritty intercept Cmd and never forward it); Ctrl+A on Linux/Win.
+        if (event == Event::CtrlA ||
+            prompt_editor_detail::pe_is_select_all(event.input())) {
+            sel_anchor_ = 0;
+            cursor_ = static_cast<int>(content_.size());
+            return true;
+        }
+
         // Shift+Enter — modifyOtherKeys variant
             if (event.input() == "\x1b\r") {
+                erase_selection();
                 content_.insert(static_cast<size_t>(cursor_), "\n");
                 ++cursor_;
                 return true;
@@ -294,6 +368,7 @@ private:
 
         // Ctrl+J = newline
         if (event.is_character() && event.character() == "\n") {
+            erase_selection();
             content_.insert(static_cast<size_t>(cursor_), "\n");
             ++cursor_;
             return true;
@@ -301,6 +376,10 @@ private:
 
         if (event.is_character()) {
             const std::string& c = event.character();
+            // Typing replaces the selection, like a normal text editor.
+            if (erase_selection()) {
+                // cursor_ now sits at the selection start; insert after it.
+            }
             content_.insert(static_cast<size_t>(cursor_), c);
             cursor_ += static_cast<int>(c.size());
             return true;
@@ -338,27 +417,79 @@ private:
         int cursor_col = 0;
         cursor_position(rows, &cursor_row, &cursor_col);
 
+        // Selection bounds in content byte offsets; inactive when collapsed.
+        const bool sel = sel_active();
+        const int sel_lo = sel ? std::min(sel_anchor_, cursor_) : -1;
+        const int sel_hi = sel ? std::max(sel_anchor_, cursor_) : -1;
+
+        Element caret = text("\u2588") | bold | color(Color::White);
+
         Elements cells;
         cells.reserve(rows.size());
         for (size_t r = 0; r < rows.size(); ++r) {
+            const int rs = static_cast<int>(rows[r].start);
+            const int re = static_cast<int>(rows[r].end);
             const std::string line = content_.substr(rows[r].start, rows[r].end - rows[r].start);
-            auto render_text = [&](const std::string& s) {
-                return text(mask_ ? prompt_editor_detail::pe_mask(s) : s);
+            auto render_text = [&](const std::string& s, bool selected) {
+                Element e = text(mask_ ? prompt_editor_detail::pe_mask(s) : s);
+                if (selected) e = e | inverted;
+                return e;
             };
+
+            // Selection span within this row (relative byte offsets).
+            const int lo_r = sel ? std::max(rs, sel_lo) - rs : re;
+            const int hi_r = sel ? std::min(re, sel_hi) - rs : re;
+            const bool row_sel = lo_r < hi_r;
+
             if (empty && r == 0) {
-                cells.push_back(hbox({
-                    text("\u2588") | bold | color(Color::White),
-                    // text("Type a prompt, press Enter to send. Shift+Enter for a new line. /help for commands.") | dim,
-                }));
+                cells.push_back(hbox({caret}));
             } else if (static_cast<int>(r) == cursor_row) {
-                const size_t local = static_cast<size_t>(cursor_) - rows[r].start;
-                cells.push_back(hbox({
-                    render_text(line.substr(0, local)),
-                    text("\u2588") | bold | color(Color::White),
-                    render_text(line.substr(local)),
-                }));
+                const int cur_r = cursor_ - rs;
+                Elements with_caret;
+                if (!row_sel) {
+                    with_caret.push_back(render_text(line.substr(0, static_cast<size_t>(cur_r)), false));
+                    with_caret.push_back(caret);
+                    with_caret.push_back(render_text(line.substr(static_cast<size_t>(cur_r)), false));
+                } else if (cur_r < lo_r) {
+                    // Caret before the selected region.
+                    with_caret.push_back(render_text(line.substr(0, static_cast<size_t>(cur_r)), false));
+                    with_caret.push_back(caret);
+                    with_caret.push_back(render_text(
+                        line.substr(static_cast<size_t>(cur_r), static_cast<size_t>(lo_r - cur_r)), false));
+                    with_caret.push_back(render_text(
+                        line.substr(static_cast<size_t>(lo_r), static_cast<size_t>(hi_r - lo_r)), true));
+                    with_caret.push_back(render_text(line.substr(static_cast<size_t>(hi_r)), false));
+                } else if (cur_r < hi_r) {
+                    // Caret inside the selected region.
+                    with_caret.push_back(render_text(line.substr(0, static_cast<size_t>(lo_r)), false));
+                    with_caret.push_back(render_text(
+                        line.substr(static_cast<size_t>(lo_r), static_cast<size_t>(cur_r - lo_r)), true));
+                    with_caret.push_back(caret);
+                    with_caret.push_back(render_text(
+                        line.substr(static_cast<size_t>(cur_r), static_cast<size_t>(hi_r - cur_r)), true));
+                    with_caret.push_back(render_text(line.substr(static_cast<size_t>(hi_r)), false));
+                } else {
+                    // Caret after the selected region.
+                    with_caret.push_back(render_text(line.substr(0, static_cast<size_t>(lo_r)), false));
+                    with_caret.push_back(render_text(
+                        line.substr(static_cast<size_t>(lo_r), static_cast<size_t>(hi_r - lo_r)), true));
+                    with_caret.push_back(render_text(
+                        line.substr(static_cast<size_t>(hi_r), static_cast<size_t>(cur_r - hi_r)), false));
+                    with_caret.push_back(caret);
+                    with_caret.push_back(render_text(line.substr(static_cast<size_t>(cur_r)), false));
+                }
+                cells.push_back(hbox(std::move(with_caret)));
             } else {
-                cells.push_back(render_text(line));
+                Elements parts;
+                if (row_sel) {
+                    parts.push_back(render_text(line.substr(0, static_cast<size_t>(lo_r)), false));
+                    parts.push_back(render_text(
+                        line.substr(static_cast<size_t>(lo_r), static_cast<size_t>(hi_r - lo_r)), true));
+                    parts.push_back(render_text(line.substr(static_cast<size_t>(hi_r)), false));
+                } else {
+                    parts.push_back(render_text(line, false));
+                }
+                cells.push_back(hbox(std::move(parts)));
             }
         }
         return vbox(std::move(cells)) | reflect(box_);

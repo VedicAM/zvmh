@@ -29,6 +29,8 @@ add_executable(zvmh src/main.cpp
     src/tui/markdown.h
     src/tui/prompt_editor.h
     src/tool/registry.h
+    src/tool/skill.h
+    src/tool/apply_patch.h
     src/tool/bash.h
     src/tool/edit.h
     src/tool/glob.h
@@ -39,6 +41,8 @@ add_executable(zvmh src/main.cpp
     src/tool/msg.h
     src/tool/peers.h
     src/tool/websearch.h
+    src/tool/webfetch.h
+    src/utf8.h
     src/server/protocol.h
     src/server/server.h
     src/server/server.cpp

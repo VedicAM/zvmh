@@ -9,10 +9,12 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "../tool/skill.h"
 
 // Built-in system context sources: core/environment (working directory, workspace
-// root, git status, platform), core/date (today's date), and core/agents-md
-// (AGENTS.md files walked up the directory tree).
+// root, git status, platform), core/date (today's date), core/agents-md
+// (AGENTS.md files walked up the directory tree), and skills/available (the set
+// of skills the SkillTool can load, so the model knows what to call).
 
 namespace sysctx {
 
@@ -102,6 +104,21 @@ inline std::string collect_agents_md() {
     return out;
 }
 
+inline std::string build_skills_block() {
+    std::vector<skills::Info> known = skills::list();
+    if (known.empty()) return "";
+    std::string out;
+    out += "<available_skills>\n";
+    for (const skills::Info& skill : known) {
+        out += "  <skill>\n";
+        out += "    <name>" + skill.name + "</name>\n";
+        out += "    <location>" + skill.location + "</location>\n";
+        out += "  </skill>\n";
+    }
+    out += "</available_skills>";
+    return out;
+}
+
 inline std::vector<RegistrationHandle> register_system_context_builtins(SystemContextRegistry& registry) {
     std::vector<RegistrationHandle> handles;
     handles.push_back(registry.register_context("core/environment", []() -> SystemContext {
@@ -137,6 +154,17 @@ inline std::vector<RegistrationHandle> register_system_context_builtins(SystemCo
                 },
                 [](const std::string& content) { return content; },
                 [](const std::string&, const std::string& content) { return content; },
+                {},
+            });
+        }));
+    }
+    if (!build_skills_block().empty()) {
+        handles.push_back(registry.register_context("skills/available", []() -> SystemContext {
+            return make(Source<std::string>{
+                Key("skills/available"),
+                []() -> std::variant<Unavailable, std::string> { return build_skills_block(); },
+                [](const std::string& block) { return block; },
+                [](const std::string&, const std::string& block) { return block; },
                 {},
             });
         }));

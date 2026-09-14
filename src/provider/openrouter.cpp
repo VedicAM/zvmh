@@ -1,5 +1,6 @@
 #include "openrouter.h"
 #include <cpr/cpr.h>
+#include "../utf8.h"
 
 OpenRouter::OpenRouter(const std::string& api_key) : Provider(api_key, "inclusionai/ling-3.0-flash-vl:free") {}
 
@@ -50,6 +51,8 @@ ChatResponse OpenRouter::chat(const std::string& prompt) {
         {"model", model_},
         {"messages", {{{"role", "user"}, {"content", prompt}}}}
     };
+
+    sanitize_json_strings(request_body);
 
     auto response = cpr::Post(
         cpr::Url{api_url()},
@@ -170,12 +173,14 @@ void OpenRouter::complete(
                 if (auto* text = std::get_if<TextBlock>(&block)) {
                     text_content += text->text;
                 } else if (auto* tool_use = std::get_if<ToolUseBlock>(&block)) {
+                    nlohmann::json args = tool_use->input;
+                    sanitize_json_strings(args);
                     tool_calls.push_back({
                         {"id", tool_use->id},
                         {"type", "function"},
                         {"function", {
                             {"name", tool_use->name},
-                            {"arguments", tool_use->input.dump()}
+                            {"arguments", args.dump()}
                         }}
                     });
                 }
@@ -192,6 +197,7 @@ void OpenRouter::complete(
         }
     }
     request_body["messages"] = api_messages;
+    sanitize_json_strings(request_body);
 
     if (!tools.empty()) {
         nlohmann::json api_tools = nlohmann::json::array();

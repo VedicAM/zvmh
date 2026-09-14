@@ -1,6 +1,8 @@
 #ifndef SERVER_PROTOCOL_H
 #define SERVER_PROTOCOL_H
 
+#include "../utf8.h"
+
 // NDJSON-over-TCP wire protocol for the zvmh swarm feature.
 //
 // Every message is a single JSON object on one line, terminated by '\n'
@@ -249,7 +251,8 @@ inline bool send_all(int fd, const char* data, size_t n) {
     return true;
 }
 
-inline bool send_json(int fd, const nlohmann::json& obj) {
+inline bool send_json(int fd, nlohmann::json obj) {
+    sanitize_json_strings(obj);
     std::string line = obj.dump() + '\n';
     return send_all(fd, line.data(), line.size());
 }
